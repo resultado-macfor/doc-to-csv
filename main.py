@@ -179,7 +179,7 @@ def processar_para_csv(texto_transcrito):
     ANALISE O TEXTO ABAIXO QUE FOI EXTRAÍDO DE UM DOCUMENTO SOBRE CULTIVARES.
     
     TEXTO EXTRAÍDO:
-    {texto_transcrito[:15000]}
+    {texto_transcrito}
     
     SUA TAREFA:
     1. Identificar TODAS as cultivares mencionadas no texto
