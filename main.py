@@ -24,8 +24,8 @@ if not gemini_api_key:
 
 try:
     genai.configure(api_key=gemini_api_key)
-    modelo_visao = genai.GenerativeModel("gemini-2.0-flash-exp")
-    modelo_texto = genai.GenerativeModel("gemini-1.5-flash")
+    modelo_visao = genai.GenerativeModel("gemini-2.5-flash")
+    modelo_texto = genai.GenerativeModel("gemini-2.5-flash")
 except Exception as e:
     st.error(f"Erro ao configurar Gemini: {str(e)}")
     st.stop()
@@ -191,7 +191,7 @@ def extrair_dados_para_csv(texto_transcrito):
     ANALISE O TEXTO ABAIXO QUE FOI EXTRAÍDO DE UM DOCUMENTO SOBRE CULTIVARES.
     
     TEXTO TRANSCRITO:
-    {texto_transcrito[:12000]}
+    {texto_transcrito}
     
     SUA TAREFA:
     1. Identifique TODAS as cultivares mencionadas
@@ -201,7 +201,7 @@ def extrair_dados_para_csv(texto_transcrito):
     {', '.join(COLUNAS)}
     
     RETORNE APENAS um array JSON. Cada objeto no array deve ter 81 propriedades
-    correspondentes às colunas acima. Use "NR" para informações não encontradas.
+    correspondentes às colunas acima. Use "NR" para informações não encontradas. Separe varios elementos identificados com ; - você está gerando um csv então utilizar vírgulas é problemático
     """
     
     try:
