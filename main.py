@@ -7,6 +7,9 @@ import tempfile
 import docx
 import io
 import json
+from PIL import Image, ImageDraw, ImageFont
+import base64
+import time
 
 # Configuração
 st.set_page_config(page_title="Extrator de Cultivares", page_icon="🌱", layout="wide")
@@ -20,12 +23,13 @@ if not gemini_api_key:
 
 try:
     genai.configure(api_key=gemini_api_key)
-    modelo = genai.GenerativeModel("gemini-1.5-flash")
+    modelo_visao = genai.GenerativeModel("gemini-2.0-flash-exp")
+    modelo_texto = genai.GenerativeModel("gemini-1.5-flash")
 except Exception as e:
     st.error(f"Erro ao configurar Gemini: {str(e)}")
     st.stop()
 
-# Colunas obrigatórias (81)
+# Colunas (81)
 COLUNAS = [
     "Cultura", "Nome do produto", "NOME TÉCNICO/ REG", "Descritivo para SEO", 
     "Fertilidade", "Grupo de maturação", "Lançamento", "Slogan", "Tecnologia", 
@@ -49,20 +53,27 @@ COLUNAS = [
     "Mês 8", "Mês 9", "Mês 10", "Mês 11", "Mês 12"
 ]
 
-def extrair_texto_docx(docx_bytes):
-    """Extrai texto de arquivo DOCX"""
+# Função 1: Converter DOCX para imagens
+def docx_para_imagens(docx_bytes):
+    """Converte DOCX para lista de imagens PNG"""
+    imagens = []
+    
     try:
+        # Salvar DOCX temporariamente
         with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
             tmp.write(docx_bytes)
-            tmp_path = tmp.name
+            docx_path = tmp.name
         
-        doc = docx.Document(tmp_path)
-        texto = []
+        # Abrir DOCX
+        doc = docx.Document(docx_path)
         
+        # Extrair todo o texto
+        texto_completo = []
         for para in doc.paragraphs:
             if para.text.strip():
-                texto.append(para.text.strip())
+                texto_completo.append(para.text)
         
+        # Extrair de tabelas
         for table in doc.tables:
             for row in table.rows:
                 row_text = []
@@ -70,356 +81,317 @@ def extrair_texto_docx(docx_bytes):
                     if cell.text.strip():
                         row_text.append(cell.text.strip())
                 if row_text:
-                    texto.append(" | ".join(row_text))
+                    texto_completo.append(" | ".join(row_text))
         
-        os.unlink(tmp_path)
-        return "\n".join(texto)
+        texto_total = "\n".join(texto_completo)
+        
+        # Limpar arquivo temporário
+        os.unlink(docx_path)
+        
+        # Dividir em "páginas" (aproximadamente 800 caracteres por página)
+        paginas = []
+        pagina_atual = ""
+        
+        for linha in texto_total.split('\n'):
+            pagina_atual += linha + "\n"
+            if len(pagina_atual) > 800:
+                paginas.append(pagina_atual)
+                pagina_atual = ""
+        
+        if pagina_atual:
+            paginas.append(pagina_atual)
+        
+        # Criar imagens para cada página
+        for i, texto_pagina in enumerate(paginas):
+            # Criar imagem
+            img = Image.new('RGB', (1200, 1600), color='white')
+            draw = ImageDraw.Draw(img)
+            
+            # Tentar carregar fonte, usar default se falhar
+            try:
+                font = ImageFont.truetype("arial.ttf", 14)
+            except:
+                font = ImageFont.load_default()
+            
+            # Adicionar texto à imagem
+            y = 50
+            for linha in texto_pagina.split('\n'):
+                if linha.strip() and y < 1550:
+                    # Quebrar linha se muito longa
+                    for parte in [linha[j:j+100] for j in range(0, len(linha), 100)]:
+                        if y < 1550:
+                            draw.text((50, y), parte, fill='black', font=font)
+                            y += 25
+            
+            imagens.append(img)
+        
+        return imagens
         
     except Exception as e:
-        st.error(f"Erro ao extrair texto: {str(e)}")
-        return ""
+        st.error(f"Erro ao converter DOCX para imagens: {str(e)}")
+        return []
 
-def processar_documento(texto):
-    """Processa documento com Gemini para extrair dados"""
+# Função 2: Transcrever imagens com modelo de visão
+def transcrever_imagens(imagens):
+    """Transcreve imagens usando Gemini Vision"""
+    texto_completo = ""
+    
+    if not imagens:
+        return texto_completo
+    
+    progress_bar = st.progress(0)
+    
+    for i, imagem in enumerate(imagens):
+        progresso = (i + 1) / len(imagens)
+        progress_bar.progress(progresso)
+        
+        try:
+            # Converter imagem para bytes
+            img_bytes = io.BytesIO()
+            imagem.save(img_bytes, format='PNG')
+            img_bytes = img_bytes.getvalue()
+            
+            # Prompt para transcrição
+            prompt = "Transcreva TODO o texto desta imagem exatamente como aparece, incluindo tabelas, números, nomes e todas as informações visíveis."
+            
+            # Enviar para Gemini Vision
+            response = modelo_visao.generate_content([
+                prompt,
+                {"mime_type": "image/png", "data": img_bytes}
+            ])
+            
+            texto_completo += f"\n\n=== PÁGINA {i+1} ===\n{response.text}\n"
+            
+            # Pequena pausa para não sobrecarregar API
+            time.sleep(0.5)
+            
+        except Exception as e:
+            texto_completo += f"\n\n=== ERRO PÁGINA {i+1}: {str(e)} ===\n"
+    
+    progress_bar.empty()
+    return texto_completo
+
+# Função 3: Processar texto para CSV
+def processar_para_csv(texto_transcrito):
+    """Processa texto transcrito para gerar CSV"""
     
     prompt = f"""
-    Você é um especialista em análise de documentos técnicos agrícolas.
+    ANALISE O TEXTO ABAIXO QUE FOI EXTRAÍDO DE UM DOCUMENTO SOBRE CULTIVARES.
     
-    ANALISE o seguinte texto extraído de um documento sobre cultivares.
-    Sua tarefa é IDENTIFICAR TODAS AS CULTIVARES mencionadas e EXTRAIR AS INFORMAÇÕES
-    para preencher um formato CSV específico.
+    TEXTO EXTRAÍDO:
+    {texto_transcrito[:15000]}
     
-    TEXTO DO DOCUMENTO:
-    {texto[:20000]}
+    SUA TAREFA:
+    1. Identificar TODAS as cultivares mencionadas no texto
+    2. Para CADA cultivar, extrair informações para preencher um CSV
+    3. Retornar os dados em formato JSON
     
-    FORMATO DE SAÍDA:
-    Você deve retornar um ARRAY JSON onde cada objeto tem EXATAMENTE 81 propriedades,
-    correspondendo às seguintes colunas (em ordem):
+    O CSV TEM ESTAS COLUNAS (81 no total):
+    {json.dumps(COLUNAS, indent=2)}
     
-    {', '.join(COLUNAS)}
+    INSTRUÇÕES:
+    - Analise o texto completo
+    - Identifique cada cultivar distinta
+    - Para cada cultivar, extraia informações do texto
+    - Use "NR" para informações não encontradas
+    - Mantenha os valores exatos do texto
+    - Não invente dados
     
-    INSTRUÇÕES DE PREENCHIMENTO:
-    
-    1. Para CADA cultivar DISTINTA encontrada no texto, crie um objeto JSON
-    2. Use "NR" para qualquer informação NÃO ENCONTRADA no texto
-    3. Extraia informações REAIS do texto - NÃO invente dados
-    4. Se o texto mencionar "lançamento", coloque "Sim" na coluna Lançamento
-    5. Para tecnologia: extraia do texto (IPRO, I2X, RR, etc.)
-    6. Para estados: converta siglas para nomes completos
-    7. Para regiões: determine baseado nos estados
-    8. Para doenças: procure por tabelas ou menções específicas
-    9. Para ícones: extraia benefícios mencionados na seção de benefícios
-    10. Para resultados: procure por tabelas de produtividade
-    
-    REGRAS DE MAPEAMENTO:
-    - Estados: PR → Paraná, SP → São Paulo, etc.
-    - Regiões: PR/SC/RS → Sul, SP/MG/RJ/ES → Sudeste, MT/MS/GO/DF → Centro-Oeste
-    - Ciclo: baseado no grupo de maturação
-    - Meses de semeadura: inferir baseado no ciclo e região
-    
-    IMPORTANTE:
-    - Analise TODO o texto para encontrar TODAS as cultivares
-    - Documentos podem ter 1, 2, 3 ou mais cultivares
-    - Cultivares podem estar em páginas diferentes
-    - Procure por nomes como NS7524IPRO, TMG7262RR, etc.
-    - Procure por seções técnicas, tabelas, características
-    
-    RETORNE APENAS o array JSON, sem explicações adicionais.
+    Retorne APENAS um array JSON onde cada objeto tem as 81 propriedades correspondentes às colunas.
     """
     
     try:
-        with st.spinner("Processando documento com IA..."):
-            response = modelo.generate_content(prompt)
-            resposta = response.text.strip()
+        response = modelo_texto.generate_content(prompt)
+        resposta = response.text.strip()
+        
+        # Tentar extrair JSON
+        resposta_limpa = resposta.replace('```json', '').replace('```', '').strip()
+        
+        try:
+            dados = json.loads(resposta_limpa)
+            if isinstance(dados, list):
+                return dados
+            elif isinstance(dados, dict):
+                return [dados]
+        except:
+            # Tentar encontrar JSON na resposta
+            inicio = resposta_limpa.find('[')
+            fim = resposta_limpa.rfind(']') + 1
             
-            # Limpar e extrair JSON
-            resposta_limpa = resposta.replace('```json', '').replace('```', '').strip()
+            if inicio != -1 and fim > inicio:
+                json_str = resposta_limpa[inicio:fim]
+                return json.loads(json_str)
             
-            # Tentar encontrar e extrair JSON
-            try:
-                # Primeira tentativa: parse direto
-                dados = json.loads(resposta_limpa)
-            except json.JSONDecodeError:
-                # Segunda tentativa: encontrar array JSON
-                inicio = resposta_limpa.find('[')
-                fim = resposta_limpa.rfind(']') + 1
-                
-                if inicio != -1 and fim > inicio:
-                    json_str = resposta_limpa[inicio:fim]
-                    dados = json.loads(json_str)
-                else:
-                    # Tentar encontrar qualquer estrutura JSON
-                    # Remover texto antes do primeiro {
-                    if '{' in resposta_limpa:
-                        inicio = resposta_limpa.find('{')
-                        fim = resposta_limpa.rfind('}') + 1
-                        if fim > inicio:
-                            json_str = resposta_limpa[inicio:fim]
-                            # Verificar se é um array
-                            if not json_str.startswith('['):
-                                json_str = f'[{json_str}]'
-                            dados = json.loads(json_str)
-                    else:
-                        st.error("Não foi possível extrair dados JSON da resposta")
-                        st.text(f"Resposta recebida:\n{resposta[:1000]}")
-                        return []
-            
-            return dados
+            return []
             
     except Exception as e:
-        st.error(f"Erro no processamento: {str(e)}")
-        st.text(f"Resposta recebida (primeiros 1000 chars):\n{resposta[:1000]}")
+        st.error(f"Erro ao processar texto: {str(e)}")
         return []
 
+# Função para criar DataFrame
 def criar_dataframe(dados):
-    """Cria DataFrame a partir dos dados extraídos"""
+    """Cria DataFrame dos dados extraídos"""
     if not dados:
         return pd.DataFrame(columns=COLUNAS)
     
     linhas = []
     for item in dados:
-        linha = {}
-        for coluna in COLUNAS:
-            # Usar valor do item ou "NR" se não existir
-            if isinstance(item, dict):
-                linha[coluna] = item.get(coluna, "NR")
-            else:
-                linha[coluna] = "NR"
-        linhas.append(linha)
+        if isinstance(item, dict):
+            linha = {}
+            for col in COLUNAS:
+                linha[col] = str(item.get(col, "NR")).strip()
+            linhas.append(linha)
     
-    return pd.DataFrame(linhas)
+    if linhas:
+        return pd.DataFrame(linhas, columns=COLUNAS)
+    else:
+        return pd.DataFrame(columns=COLUNAS)
 
-def gerar_csv_tab(df):
-    """Gera string CSV com separador TAB"""
-    output = io.StringIO()
-    
-    # Escrever cabeçalho
-    output.write("\t".join(COLUNAS))
-    output.write("\n")
-    
-    # Escrever dados
-    for _, row in df.iterrows():
-        linha = []
-        for col in COLUNAS:
-            valor = str(row[col]) if col in row else "NR"
-            linha.append(valor)
-        output.write("\t".join(linha))
-        output.write("\n")
-    
-    return output.getvalue()
-
-# Interface principal
+# Interface
 def main():
     st.sidebar.header("📤 Upload do Documento")
     
     uploaded_file = st.sidebar.file_uploader(
-        "Carregue um arquivo DOCX com informações de cultivares:",
+        "Carregue um arquivo DOCX:",
         type=["docx"]
     )
     
     if uploaded_file:
-        st.sidebar.info(f"📄 {uploaded_file.name} ({uploaded_file.size/1024:.1f} KB)")
+        st.sidebar.info(f"📄 {uploaded_file.name}")
         
-        col1, col2 = st.sidebar.columns(2)
-        with col1:
-            processar = st.button("🚀 Processar Documento", type="primary", use_container_width=True)
-        with col2:
-            if st.button("🔄 Limpar", use_container_width=True):
-                if 'df_cultivares' in st.session_state:
-                    del st.session_state.df_cultivares
-                if 'texto_original' in st.session_state:
-                    del st.session_state.texto_original
-                if 'nome_arquivo' in st.session_state:
-                    del st.session_state.nome_arquivo
-                st.rerun()
-        
-        if processar:
-            with st.spinner("Extraindo texto do documento..."):
-                # Extrair texto
-                texto = extrair_texto_docx(uploaded_file.getvalue())
-                
-                if not texto:
-                    st.error("Não foi possível extrair texto do documento")
-                    return
-                
-                st.info(f"✅ Texto extraído ({len(texto):,} caracteres)")
-                
-                # Mostrar preview
-                with st.expander("📝 Visualizar texto extraído", expanded=False):
-                    st.text_area("Conteúdo:", texto[:3000] + ("..." if len(texto) > 3000 else ""), 
-                               height=200, key="texto_preview")
-                
-                # Processar com Gemini
-                dados = processar_documento(texto)
-                
-                if not dados:
-                    st.warning("⚠️ Nenhuma cultivar encontrada no documento")
-                    # Criar DataFrame vazio
-                    st.session_state.df_cultivares = pd.DataFrame(columns=COLUNAS)
-                else:
-                    st.success(f"✅ {len(dados)} cultivar(s) identificada(s)")
-                    
-                    # Criar DataFrame
-                    df = criar_dataframe(dados)
-                    
-                    # Salvar em session state
-                    st.session_state.df_cultivares = df
-                    st.session_state.texto_original = texto
-                    st.session_state.nome_arquivo = uploaded_file.name
-        
-        # Mostrar resultados se disponíveis
-        if 'df_cultivares' in st.session_state:
-            df = st.session_state.df_cultivares
+        if st.sidebar.button("🚀 Processar Documento", type="primary"):
+            # Limpar estado anterior
+            for key in ['imagens', 'texto', 'dados', 'df']:
+                if key in st.session_state:
+                    del st.session_state[key]
             
-            if df.empty:
-                st.warning("Nenhum dado disponível para exibição.")
-                return
-                
-            st.header("📊 Resultados da Extração")
+            # PASSO 1: Converter DOCX para imagens
+            with st.spinner("Convertendo DOCX para imagens..."):
+                imagens = docx_para_imagens(uploaded_file.getvalue())
+                if imagens:
+                    st.session_state.imagens = imagens
+                    st.success(f"✅ Convertido em {len(imagens)} página(s)")
+                else:
+                    st.error("Falha na conversão")
+                    return
+            
+            # PASSO 2: Transcrever imagens
+            with st.spinner("Transcrevendo imagens com IA..."):
+                texto = transcrever_imagens(imagens)
+                if texto:
+                    st.session_state.texto = texto
+                    st.success(f"✅ Transcrição concluída")
+                    
+                    # Mostrar preview
+                    with st.expander("📝 Ver texto transcrito"):
+                        st.text_area("Texto:", texto[:2000] + ("..." if len(texto) > 2000 else ""), height=200)
+                else:
+                    st.error("Falha na transcrição")
+                    return
+            
+            # PASSO 3: Processar para CSV
+            with st.spinner("Extraindo dados para CSV..."):
+                dados = processar_para_csv(texto)
+                if dados:
+                    st.session_state.dados = dados
+                    st.success(f"✅ {len(dados)} cultivar(s) encontrada(s)")
+                else:
+                    st.warning("Nenhum dado extraído")
+                    return
+            
+            # PASSO 4: Criar DataFrame
+            df = criar_dataframe(dados)
+            if not df.empty:
+                st.session_state.df = df
+    
+    # Mostrar resultados
+    if 'df' in st.session_state and st.session_state.df is not None:
+        df = st.session_state.df
+        
+        if not df.empty:
+            st.header("📊 Resultados")
             
             # Estatísticas
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             with col1:
-                st.metric("Cultivares Extraídas", len(df))
+                st.metric("Cultivares", len(df))
             with col2:
-                if 'Cultura' in df.columns:
-                    culturas = df['Cultura'].unique()
-                    st.metric("Tipos de Cultura", len(culturas))
-                else:
-                    st.metric("Colunas", len(df.columns))
-            with col3:
-                if 'Tecnologia' in df.columns:
-                    techs = df['Tecnologia'].unique()
-                    techs_validos = [t for t in techs if t != "NR" and str(t) != "nan"]
-                    st.metric("Tecnologias", len(techs_validos))
+                st.metric("Colunas", len(df.columns))
             
-            # Visualização principal
-            st.subheader("📋 Dados Extraídos")
+            # Visualizar dados
+            st.subheader("Dados Extraídos")
             
-            # Mostrar colunas principais
-            colunas_para_mostrar = [
-                'Cultura', 'Nome do produto', 'Tecnologia', 'Grupo de maturação',
-                'Fertilidade', 'Lançamento', 'Estado (por extenso)'
-            ]
-            
+            # Mostrar algumas colunas principais
+            colunas_para_mostrar = ['Cultura', 'Nome do produto', 'Tecnologia', 
+                                   'Grupo de maturação', 'Fertilidade', 'Estado (por extenso)']
             colunas_disponiveis = [c for c in colunas_para_mostrar if c in df.columns]
             
             if colunas_disponiveis:
-                st.dataframe(df[colunas_disponiveis], use_container_width=True, height=300)
+                st.dataframe(df[colunas_disponiveis], use_container_width=True)
             else:
-                st.dataframe(df.iloc[:, :10], use_container_width=True, height=300)
-            
-            # Visualização completa
-            with st.expander("🔍 Visualizar TODAS as 81 colunas", expanded=False):
-                st.dataframe(df, use_container_width=True, height=400)
+                st.dataframe(df, use_container_width=True)
             
             # Download
-            st.subheader("📥 Download dos Arquivos")
+            st.subheader("📥 Download")
             
-            nome_base = st.session_state.get('nome_arquivo', 'cultivares').split('.')[0]
+            nome_base = uploaded_file.name.split('.')[0] if uploaded_file else "cultivares"
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
-            col1, col2, col3 = st.columns(3)
+            # CSV com TAB
+            csv_content = "\t".join(COLUNAS) + "\n"
+            for _, row in df.iterrows():
+                linha = [str(row.get(col, "NR")).strip() for col in COLUNAS]
+                csv_content += "\t".join(linha) + "\n"
+            
+            col1, col2 = st.columns(2)
             
             with col1:
-                # CSV com TAB
-                csv_content = gerar_csv_tab(df)
                 st.download_button(
-                    label="📄 Baixar CSV (TAB)",
+                    label="📄 Baixar CSV",
                     data=csv_content,
                     file_name=f"{nome_base}_{timestamp}.csv",
-                    mime="text/csv",
-                    use_container_width=True
+                    mime="text/csv"
                 )
             
             with col2:
                 # Excel
                 excel_buffer = io.BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Cultivares')
+                    df.to_excel(writer, index=False)
                 excel_data = excel_buffer.getvalue()
                 
                 st.download_button(
                     label="📊 Baixar Excel",
                     data=excel_data,
                     file_name=f"{nome_base}_{timestamp}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-            
-            with col3:
-                # Texto original
-                if 'texto_original' in st.session_state:
-                    texto = st.session_state.texto_original
-                    if texto:
-                        st.download_button(
-                            label="📝 Baixar Texto",
-                            data=texto,
-                            file_name=f"{nome_base}_texto_{timestamp}.txt",
-                            mime="text/plain",
-                            use_container_width=True
-                        )
-            
-            # Informações técnicas
-            with st.expander("⚙️ Informações Técnicas", expanded=False):
-                st.write(f"**Total de colunas:** {len(df.columns)}")
-                
-                # Contar colunas preenchidas
-                colunas_preenchidas = 0
-                for coluna in df.columns:
-                    if not df[coluna].isna().all() and not (df[coluna] == "NR").all():
-                        colunas_preenchidas += 1
-                
-                st.write(f"**Colunas com dados:** {colunas_preenchidas}")
-                
-                if not df.empty:
-                    st.write(f"**Primeira cultivar extraída:**")
-                    primeira = df.iloc[0].to_dict()
-                    # Mostrar apenas valores não "NR"
-                    primeira_filtrada = {k: v for k, v in primeira.items() if v != "NR" and str(v) != "nan"}
-                    st.json(primeira_filtrada)
+    
+    elif 'imagens' in st.session_state:
+        # Mostrar que o processamento está incompleto
+        st.info("Processamento concluído, mas nenhuma cultivar foi identificada.")
     
     else:
         # Tela inicial
         st.markdown("""
-        ## 🌱 Extrator Automático de Cultivares
+        ## 🌱 Pipeline de Extração de Cultivares
         
-        Este sistema extrai automaticamente informações de documentos DOCX sobre cultivares
-        e gera um arquivo CSV com **81 colunas específicas**.
+        **Fluxo do processamento:**
         
-        ### 🎯 Como funciona:
-        1. **Carregue** um DOCX com informações técnicas de cultivares
-        2. **Processe** com IA para identificar todas as cultivares
-        3. **Extraia** automaticamente informações para 81 colunas
-        4. **Baixe** o CSV formatado ou Excel
+        1. **📤 Upload DOCX** - Carregue seu documento
+        2. **🖼️ DOCX → Imagens** - Cada página vira uma imagem
+        3. **👁️ Imagens → Texto** - Modelo de visão transcreve tudo
+        4. **📝 Texto → CSV** - Modelo de texto extrai dados para 81 colunas
+        5. **📊 Resultados** - Visualize e baixe os dados
         
-        ### 📊 Colunas extraídas:
-        - **Informações básicas**: Cultura, nome, tecnologia, fertilidade
-        - **Características técnicas**: PMS, tipo de crescimento, cores
-        - **Resistência a doenças**: 8 doenças diferentes
-        - **Recomendações**: Texto técnico completo
-        - **Região e época**: Estados, UF, meses de semeadura
-        - **Ícones e benefícios**: Até 5 benefícios por cultivar
-        - **Resultados**: Até 7 resultados de produtividade
+        **Por que converter para imagens?**
+        - Captura formatação original
+        - Lê tabelas e gráficos
+        - Funciona com qualquer layout
+        - Preserva informações visuais
         
-        ### ⚡ Processamento inteligente:
-        - Identifica **múltiplas cultivares** por documento
-        - Extrai dados de **tabelas e textos**
-        - Converte **siglas para nomes completos**
-        - Determina **regiões automaticamente**
-        - Infere **ciclo e meses de semeadura**
-        
-        ### ✅ Pronto para usar:
-        Basta carregar seu DOCX na barra lateral e clicar em "Processar Documento"!
+        **Pronto para começar?** Carregue um DOCX na barra lateral!
         """)
-
-# Inicializar session state
-if 'df_cultivares' not in st.session_state:
-    st.session_state.df_cultivares = None
-if 'texto_original' not in st.session_state:
-    st.session_state.texto_original = ""
-if 'nome_arquivo' not in st.session_state:
-    st.session_state.nome_arquivo = ""
 
 if __name__ == "__main__":
     main()
