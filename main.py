@@ -11,7 +11,6 @@ from pathlib import Path
 import docx
 from docx2pdf import convert
 import pdf2image
-import base64
 
 # Configuração da página
 st.set_page_config(
@@ -32,33 +31,33 @@ if not gemini_api_key:
 
 try:
     genai.configure(api_key=gemini_api_key)
-    modelo_vision = genai.GenerativeModel("gemini-2.5-flash")  # Melhor para visão
+    modelo_vision = genai.GenerativeModel("gemini-2.5-flash")
     modelo_texto = genai.GenerativeModel("gemini-2.5-flash")
 except Exception as e:
     st.error(f"Erro ao configurar o Gemini: {str(e)}")
     st.stop()
 
-# Função para converter DOCX para imagens
+# Função para converter DOCX para imagens (Linux compatível)
 def converter_docx_para_imagens(docx_bytes, nome_arquivo):
-    """Converte um arquivo DOCX para uma lista de imagens PNG (uma por página)"""
+    """Converte DOCX para imagens usando python-docx e PIL (Linux compatível)"""
     
     imagens = []
     
     try:
-        # Criar arquivo temporário DOCX
+        # Salvar em arquivo temporário
         with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp_docx:
             tmp_docx.write(docx_bytes)
             tmp_docx_path = tmp_docx.name
         
-        # Converter DOCX para PDF
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_pdf:
-            tmp_pdf_path = tmp_pdf.name
-        
         try:
-            convert(tmp_docx_path, tmp_pdf_path)
+            # Tentar converter para PDF primeiro (se funcionar no sistema)
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_pdf:
+                tmp_pdf_path = tmp_pdf.name
             
-            # Converter PDF para imagens
             try:
+                convert(tmp_docx_path, tmp_pdf_path)
+                
+                # Converter PDF para imagens
                 images_from_pdf = pdf2image.convert_from_path(
                     tmp_pdf_path, 
                     dpi=150,
@@ -67,74 +66,60 @@ def converter_docx_para_imagens(docx_bytes, nome_arquivo):
                 imagens.extend(images_from_pdf)
                 
             except Exception as e:
-                st.warning(f"Erro com poppler: {str(e)}. Tentando método alternativo...")
-                # Fallback: tentar sem poppler
-                try:
-                    images_from_pdf = pdf2image.convert_from_bytes(
-                        open(tmp_pdf_path, 'rb').read(),
-                        dpi=150,
-                        fmt='PNG'
-                    )
-                    imagens.extend(images_from_pdf)
-                except Exception as e2:
-                    st.error(f"Erro na conversão PDF para imagens: {str(e2)}")
-                    # Tentar extrair texto diretamente do DOCX
-                    doc = docx.Document(tmp_docx_path)
-                    texto_completo = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-                    
-                    # Criar imagem com o texto
+                # Fallback: extrair texto diretamente do DOCX
+                st.info("Usando método alternativo de extração de texto...")
+                doc = docx.Document(tmp_docx_path)
+                
+                # Agrupar parágrafos em páginas (aproximadamente 800 caracteres por página)
+                texto_completo = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+                
+                # Dividir texto em "páginas" para processamento
+                paginas_texto = []
+                pag_atual = ""
+                
+                for linha in texto_completo.split('\n'):
+                    pag_atual += linha + "\n"
+                    if len(pag_atual) > 800:  # Limite por "página"
+                        paginas_texto.append(pag_atual)
+                        pag_atual = ""
+                
+                if pag_atual:
+                    paginas_texto.append(pag_atual)
+                
+                # Criar imagens a partir do texto
+                for i, texto_pagina in enumerate(paginas_texto):
                     from PIL import ImageDraw, ImageFont
-                    img = Image.new('RGB', (1200, 1600), color='white')
+                    # Tamanho da página A4 em pixels (150 DPI)
+                    img = Image.new('RGB', (1240, 1754), color='white')
                     d = ImageDraw.Draw(img)
                     
                     try:
-                        font = ImageFont.truetype("arial.ttf", 16)
+                        font = ImageFont.truetype("arial.ttf", 14)
                     except:
                         font = ImageFont.load_default()
                     
                     # Adicionar texto à imagem
-                    lines = texto_completo.split('\n')
-                    y = 50
+                    lines = texto_pagina.split('\n')
+                    y = 100
                     for line in lines:
-                        if y < 1550:
-                            d.text((50, y), line[:150], fill='black', font=font)
-                            y += 30
+                        if line.strip() and y < 1650:
+                            # Quebrar linhas muito longas
+                            max_chars = 120
+                            for i in range(0, len(line), max_chars):
+                                if y < 1650:
+                                    d.text((100, y), line[i:i+max_chars], fill='black', font=font)
+                                    y += 25
                     
                     imagens.append(img)
-                
-        except Exception as e:
-            st.warning(f"Erro na conversão DOCX para PDF: {str(e)}")
-            # Se docx2pdf falhar, extrair texto diretamente do DOCX
-            doc = docx.Document(tmp_docx_path)
-            texto_completo = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-            
-            # Criar imagem com o texto
-            from PIL import ImageDraw, ImageFont
-            img = Image.new('RGB', (1200, 1600), color='white')
-            d = ImageDraw.Draw(img)
-            
-            try:
-                font = ImageFont.truetype("arial.ttf", 16)
-            except:
-                font = ImageFont.load_default()
-            
-            # Adicionar texto à imagem
-            lines = texto_completo.split('\n')
-            y = 50
-            for line in lines:
-                if y < 1550:
-                    d.text((50, y), line[:150], fill='black', font=font)
-                    y += 30
-            
-            imagens.append(img)
         
-        # Limpar arquivos temporários
-        try:
-            os.unlink(tmp_docx_path)
-            if os.path.exists(tmp_pdf_path):
-                os.unlink(tmp_pdf_path)
-        except:
-            pass
+        finally:
+            # Limpar arquivos temporários
+            try:
+                os.unlink(tmp_docx_path)
+                if 'tmp_pdf_path' in locals() and os.path.exists(tmp_pdf_path):
+                    os.unlink(tmp_pdf_path)
+            except:
+                pass
         
         return imagens
         
@@ -201,7 +186,7 @@ def transcrever_todas_paginas(imagens):
             texto_completo += texto_pagina
             
             # Pequena pausa para não sobrecarregar a API
-            time.sleep(1)
+            time.sleep(0.5)
             
         except Exception as e:
             texto_erro = f"\n\n{'='*60}\nERRO na página {pagina_num}: {str(e)}\n{'='*60}\n"
@@ -216,89 +201,100 @@ def transcrever_todas_paginas(imagens):
 def converter_texto_para_csv_completo(texto_transcrito):
     """Converte todo o texto transcrito em CSV com todas as colunas"""
     
+    # Remover limite do texto - processar TUDO
     prompt = f"""
-    Você recebeu a transcrição COMPLETA de um documento DOCX sobre cultivares de soja e milho.
-    O documento foi convertido para imagens e transcrito página por página.
+    VOCÊ É UM ESPECIALISTA EM AGRICULTURA E EXTRATOR DE DADOS.
     
-    TEXTO TRANSCRITO COMPLETO (todas as páginas):
-    {texto_transcrito[:15000]}  # Limitar para caber no contexto
+    VOCÊ RECEBEU A TRANSCRIÇÃO COMPLETA DE UM DOCUMENTO TÉCNICO SOBRE CULTIVARES DE SOJA.
+    ANALISE TODO O TEXTO E EXTRAIA INFORMAÇÕES SOBRE TODAS AS CULTIVARES MENCIONADAS.
     
-    SUA TAREFA:
-    Analise TODO o texto acima e extraia informações sobre TODAS as cultivares mencionadas.
-    Para CADA cultivar encontrada, crie UMA LINHA no formato CSV abaixo.
+    TEXTO TRANSCRITO COMPLETO:
+    {texto_transcrito}
     
-    FORMATO CSV REQUERIDO (colunas separadas por TAB - \t):
+    SUA TAREFA CRÍTICA:
+    Para CADA cultivar encontrada, crie UMA LINHA no formato CSV abaixo com TODAS as 81 colunas.
+    
+    FORMATO CSV EXATO (81 colunas separadas por TAB):
     Cultura	Nome do produto	NOME TÉCNICO/ REG	Descritivo para SEO	Fertilidade	Grupo de maturação	Lançamento	Slogan	Tecnologia	Região (por extenso)	Estado (por extenso)	Ciclo	Finalidade	URL da imagem do mapa	Número do ícone	Titulo icone 1	Descrição Icone 1	Número do ícone	Titulo icone 2	Descrição Icone 2	Número do ícone	Titulo icone 3	Descrição Icone 3	Número do ícone	Título icone 4	Descrição Icone 4	Número do ícone	Título icone 5	Descrição Icone 5	Exigência à fertilidade	Grupo de maturidade	PMS MÉDIO	Tipo de crescimento	Cor da flor	Cor da pubescência	Cor do hilo	Cancro da haste	Pústula bacteriana	Nematoide das galhas - M. javanica	Nematóide de Cisto (Raça 3)	Nematóide de Cisto (Raça 9)	Nematóide de Cisto (Raça 10)	Nematóide de Cisto (Raça 14)	Fitóftora (Raça 1)	Recomendações	Resultado 1 - Nome	Resultado 1 - Local	Resultado 1	Resultado 2 - Nome	Resultado 2 - Local	Resultado 2	Resultado 3 - Nome	Resultado 3 - Local	Resultado 3	Resultado 4 - Nome	Resultado 4 - Local	Resultado 4	Resultado 5 - Nome	Resultado 5 - Local	Resultado 5	Resultado 6 - Nome	Resultado 6 - Local	Resultado 6	Resultado 7 - Nome	Resultado 7 - Local	Resultado 7	REC	UF	Região	Mês 1	Mês 2	Mês 3	Mês 4	Mês 5	Mês 6	Mês 7	Mês 8	Mês 9	Mês 10	Mês 11	Mês 12
-
-    INSTRUÇÕES DETALHADAS:
     
-    1. IDENTIFICAÇÃO DAS CULTIVARES:
-       - Procure por nomes de cultivares como NS7524IPRO, NS6595I2X, etc.
-       - Cada cultivar DISTINTA deve ter sua própria linha
-       - O documento pode ter dezenas de cultivares - extraia TODAS
+    INSTRUÇÕES DETALHADAS PARA CADA COLUNA (81 colunas no total):
     
-    2. PREENCHIMENTO DAS COLUNAS:
+    COLUNAS 1-13 (Informações básicas):
+    1. Cultura: "Soja"
+    2. Nome do produto: Nome completo da cultivar (ex: N5659512X, NS802512X)
+    3. NOME TÉCNICO/REG: Mesmo que nome do produto
+    4. Descritivo para SEO: Crie uma descrição de 15-20 palavras
+    5. Fertilidade: Extraia do texto (Alto, Médio e alto, etc.)
+    6. Grupo de maturação: Número (ex: 6.5, 8)
+    7. Lançamento: "Sim" se mencionar "lançamento"
+    8. Slogan: Frase de marketing
+    9. Tecnologia: 12X, IPRO, I2X, etc.
+    10. Região (por extenso): Baseado nos estados
+    11. Estado (por extenso): Nomes completos
+    12. Ciclo: Precoce, Médio, Tardio (inferir do grupo)
+    13. Finalidade: "Grãos"
     
-    A. INFORMAÇÕES BÁSICAS:
-       - Cultura: "Soja" ou "Milho" (inferir do contexto)
-       - Nome do produto: Nome completo da cultivar (ex: NS7524IPRO)
-       - NOME TÉCNICO/REG: Mesmo que nome do produto
-       - Descritivo para SEO: Crie uma descrição de 10-15 palavras
-       - Fertilidade: Alto, Médio ou Baixo
-       - Grupo de maturação: Número (ex: 7.5, 6.5)
-       - Lançamento: "Sim" se mencionar "lançamento", "nova", etc.
-       - Slogan: Frase de marketing se houver
-       - Tecnologia: IPRO, I2X, XtendFlex, etc.
+    COLUNAS 14-28 (Ícones e descrições):
+    14. URL da imagem do mapa: "NR"
+    15. Número do ícone: "1"
+    16. Titulo icone 1: Primeiro benefício
+    17. Descrição Icone 1: Descrição do primeiro benefício
+    18. Número do ícone: "2"
+    19. Titulo icone 2: Segundo benefício
+    20. Descrição Icone 2: Descrição do segundo benefício
+    21. Número do ícone: "3"
+    22. Titulo icone 3: Terceiro benefício
+    23. Descrição Icone 3: Descrição do terceiro benefício
+    24. Número do ícone: "4"
+    25. Título icone 4: Quarto benefício (ou "NR")
+    26. Descrição Icone 4: Descrição (ou "NR")
+    27. Número do ícone: "5"
+    28. Título icone 5: Quinto benefício (ou "NR")
+    29. Descrição Icone 5: Descrição (ou "NR")
     
-    B. REGIÃO E CICLO:
-       - Região (por extenso): Sul, Sudeste, Centro-Oeste, Nordeste, Norte
-       - Estado (por extenso): Nomes completos dos estados recomendados
-       - Ciclo: Precoce, Médio, Tardio
-       - Finalidade: "Grãos"
-       - URL da imagem do mapa: "NR"
+    COLUNAS 30-41 (Características técnicas):
+    30. Exigência à fertilidade: Mesmo que coluna 5
+    31. Grupo de maturidade: Mesmo que coluna 6
+    32. PMS MÉDIO: Peso em gramas (ex: 165g, 157g)
+    33. Tipo de crescimento: Indeterminado, Semideterminado, Determinado
+    34. Cor da flor: Branca, Roxa, etc.
+    35. Cor da pubescência: Marrom média, etc.
+    36. Cor do hilo: Marrom, etc.
+    37. Cancro da haste: S, M, MR, R, X
+    38. Pústula bacteriana: S, M, MR, R, X
+    39. Nematoide das galhas - M. javanica: S, M, MR, R, X
+    40. Nematóide de Cisto (Raça 3): S, M, MR, R, X
+    41. Nematóide de Cisto (Raça 9): S, M, MR, R, X
+    42. Nematóide de Cisto (Raça 10): S, M, MR, R, X
+    43. Nematóide de Cisto (Raça 14): S, M, MR, R, X
+    44. Fitóftora (Raça 1): S, M, MR, R, X
     
-    C. ÍCONES (até 5 benefícios):
-       - Extraia os principais benefícios do texto
-       - Use números de 1 a 5 para os ícones
+    COLUNAS 45-71 (Recomendações e resultados):
+    45. Recomendações: Texto padrão sobre condições edafoclimáticas
+    46-58. Resultados 1-7: Nome, Local, Produtividade (preencher "NR" se não houver)
     
-    D. CARACTERÍSTICAS TÉCNICAS (soja):
-       - PMS MÉDIO: Peso de mil sementes (ex: 150G)
-       - Tipo de crescimento: Indeterminado, Semideterminado, Determinado
-       - Cores: Flor, pubescência, hilo
-       - Doenças: Use S (Suscetível), MS, MR, R (Resistente), X
+    COLUNAS 72-81 (Regiões e meses):
+    72. REC: "NR"
+    73. UF: Siglas dos estados
+    74. Região: Mesmo que coluna 10
+    75-86. Mês 1 a Mês 12: "180-260" para meses de semeadura, "NR" para outros
     
-    E. RESULTADOS DE PRODUTIVIDADE:
-       - Extraia até 7 resultados se disponíveis
-       - Formato: Nome do teste, Local, Produtividade
+    REGRAS IMPORTANTES:
+    1. Você DEVE retornar EXATAMENTE 81 colunas por linha
+    2. Se não encontrar informação, use "NR"
+    3. Para doenças: use X quando não mencionado
+    4. Para ícones: preencha até 5, use "NR" para extras não existentes
+    5. Recomendações: Texto padrão completo
     
-    F. EPOCA DE SEMEADURA (MESES):
-       - Para meses com recomendação: "180-260"
-       - Para outros: "NR"
+    TEXTO PADRÃO PARA RECOMENDAÇÕES (coluna 45):
+    "Pode haver variação no ciclo (dias) devido às condições edafoclimáticas, época de plantio e manejo aplicado. Recomendações de população final de plantas e de época de semeadura foram construídas com base em resultados de experimentos próprios conduzidos na região e servem como direcionamento da população ideal de plantas para cada talhão. Deve-se levar em consideração: condições edafoclimáticas; textura; fertilidade do solo; adubação; nível de manejo; germinação; vigor da semente; umidade do solo entre outros fatores. Consultar recomendação de Zoneamento Agrícola de Risco Climático para a cultura de acordo com Ministério da Agricultura, Pecuária e Abastecimento."
     
-    3. REGRAS GERAIS:
-       - Use "NR" para informações não encontradas
-       - Para estados: SP = São Paulo, PR = Paraná, etc.
-       - Para regiões: 
-         * Sul: PR, SC, RS
-         * Sudeste: SP, MG, RJ, ES
-         * Centro-Oeste: MT, MS, GO, DF
-         * Nordeste: BA, MA, PI, etc.
-         * Norte: PA, RO, TO, etc.
-       - Mantenha valores exatos quando disponíveis
+    BASEADO NO TEXTO QUE VOCÊ TEM, IDENTIFIQUE TODAS AS CULTIVARES E PREENCHA TODAS AS 81 COLUNAS.
     
-    4. FORMATO DE SAÍDA:
-       - UMA LINHA POR CULTIVAR
-       - Separar valores por TAB (\t)
-       - Separar linhas por nova linha (\n)
-       - SEM cabeçalho na saída
-       - APENAS as linhas de dados
+    Retorne APENAS as linhas CSV, UMA LINHA POR CULTIVAR, sem cabeçalho, sem explicações.
+    Separe valores por TAB.
+    Separe linhas por nova linha.
     
-    EXEMPLO de duas linhas:
-    Soja	NS7524IPRO	NS7524IPRO	Cultivar de soja IPRO com alto potencial produtivo	Alto	7.5	Sim	Excelente performance produtiva	IPRO	Sul, Sudeste	Paraná, Santa Catarina, São Paulo	Precoce	Grãos	NR	1	Alto potencial produtivo	Excelente performance em diversas regiões	2	Resistência a nematoides	Múltipla resistência a nematoides de cisto	3	NR	NR	4	NR	NR	5	NR	NR	Alto	7.5	150G	Semideterminado	Roxa	Marrom média	Preto	R	MR	R	R	MR	MR	MR	MR	Pode haver variação no ciclo (dias) devido às condições edafoclimáticas, época de plantio e manejo aplicado. Recomendações de população final de plantas e de época de semeadura foram construídas com base em resultados de experimentos próprios conduzidos na região e servem como direcionamento da população ideal de plantas para cada talhão. Deve-se levar em consideração: condições edafoclimáticas; textura; fertilidade do solo; adubação; nível de manejo; germinação; vigor da semente; umidade do solo entre outros fatores. Consultar recomendação de Zoneamento Agrícola de Risco Climático para a cultura de acordo com Ministério da Agricultura, Pecuária e Abastecimento.	Ensaio Regional	Paraná	85.5 sc/ha	Ensaio Estadual	Santa Catarina	82.3 sc/ha	Ensaio Regional	São Paulo	80.1 sc/ha	NR	NR	NR	NR	NR	NR	NR	NR	NR	NR	NR	NR	NR	PR, SC, SP	Sul, Sudeste	NR	NR	180-260	180-260	180-260	180-260	180-260	180-260	180-260	180-260	180-260	NR
-    Soja	NS6595I2X	NS6595I2X	Cultivar de soja I2X com tecnologia inovadora	Alto	6.5	Sim	O caminho da alta produtividade	I2X	Sul, Centro-Oeste	Paraná, Mato Grosso do Sul	Médio	Grãos	NR	1	Tecnologia I2X	Benefícios da tecnologia I2X	2	Alta produtividade	Potencial produtivo comprovado	3	NR	NR	4	NR	NR	5	NR	NR	Alto	6.5	155G	Indeterminado	Branca	Cinza	Marrom	MR	MS	MS	MS	S	S	S	S	Pode haver variação no ciclo (dias) devido às condições edafoclimáticas, época de plantio e manejo aplicado. Recomendações de população final de plantas e de época de semeadura foram construídas com base em resultados de experimentos próprios conduzidos na região e servem como direcionamento da população ideal de plantas para cada talhão. Deve-se levar em consideração: condições edafoclimáticas; textura; fertilidade do solo; adubação; nível de manejo; germinação; vigor da semente; umidade do solo entre outros fatores. Consultar recomendação de Zoneamento Agrícola de Risco Climático para a cultura de acordo com Ministério da Agricultura, Pecuária e Abastecimento.	Ensaio Estadual	Mato Grosso do Sul	78.5 sc/ha	Ensaio Regional	Paraná	76.2 sc/ha	NR	NR	NR	NR	NR	NR	NR	NR	NR	NR	NR	NR	NR	PR, MS	Sul, Centro-Oeste	NR	NR	180-260	180-260	180-260	180-260	NR	NR	NR	NR	NR	NR	NR
-    
-    Agora, analise TODO o texto transcrito e extraia TODAS as cultivares.
-    Retorne APENAS as linhas CSV, sem explicações adicionais.
     """
     
     try:
@@ -311,13 +307,27 @@ def converter_texto_para_csv_completo(texto_transcrito):
         for linha in resultado.split('\n'):
             linha = linha.strip()
             if linha and '\t' in linha:  # Linha válida deve ter tabs
+                # Contar colunas
+                num_colunas = len(linha.split('\t'))
+                if num_colunas < 81:
+                    # Adicionar colunas faltantes com "NR"
+                    partes = linha.split('\t')
+                    while len(partes) < 81:
+                        partes.append("NR")
+                    linha = '\t'.join(partes)
+                elif num_colunas > 81:
+                    # Remover colunas extras
+                    partes = linha.split('\t')
+                    linha = '\t'.join(partes[:81])
+                
                 linhas_csv.append(linha)
         
         return linhas_csv
             
     except Exception as e:
         st.error(f"Erro na conversão para CSV: {str(e)}")
-        st.write("Resposta do modelo:", resultado[:1000] if 'resultado' in locals() else "Nenhuma resposta")
+        if 'resultado' in locals():
+            st.write("Resposta do modelo:", resultado[:2000])
         return []
 
 # Interface principal
@@ -329,6 +339,8 @@ def main():
         st.session_state.texto_transcrito = ""
     if 'linhas_csv' not in st.session_state:
         st.session_state.linhas_csv = []
+    if 'uploaded_file_name' not in st.session_state:
+        st.session_state.uploaded_file_name = ""
     
     # Sidebar para upload
     with st.sidebar:
@@ -341,49 +353,54 @@ def main():
         )
         
         if uploaded_file:
+            st.session_state.uploaded_file_name = uploaded_file.name
             st.write(f"**Arquivo:** {uploaded_file.name}")
             st.write(f"**Tamanho:** {uploaded_file.size / 1024:.1f} KB")
             
-            if st.button("🔍 Processar Documento", type="primary", use_container_width=True):
-                with st.spinner("Iniciando processamento..."):
-                    # Resetar estado
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🔍 Processar Documento", type="primary", use_container_width=True):
+                    with st.spinner("Iniciando processamento..."):
+                        # Resetar estado
+                        st.session_state.imagens_convertidas = []
+                        st.session_state.texto_transcrito = ""
+                        st.session_state.linhas_csv = []
+                        
+                        # 1. Converter DOCX para imagens
+                        st.info("Convertendo DOCX para imagens...")
+                        docx_bytes = uploaded_file.getvalue()
+                        imagens = converter_docx_para_imagens(docx_bytes, uploaded_file.name)
+                        
+                        if not imagens:
+                            st.error("Falha na conversão do DOCX")
+                            return
+                        
+                        st.session_state.imagens_convertidas = imagens
+                        st.success(f"✅ Convertido em {len(imagens)} página(s)")
+                        
+                        # 2. Transcrever todas as páginas
+                        st.info("Transcrevendo páginas com modelo de visão...")
+                        texto_transcrito = transcrever_todas_paginas(imagens)
+                        st.session_state.texto_transcrito = texto_transcrito
+                        
+                        st.success(f"✅ Transcrição concluída ({len(texto_transcrito):,} caracteres)")
+                        
+                        # 3. Converter texto para CSV
+                        st.info("Gerando CSV com todas as cultivares...")
+                        linhas_csv = converter_texto_para_csv_completo(texto_transcrito)
+                        st.session_state.linhas_csv = linhas_csv
+                        
+                        if linhas_csv:
+                            st.success(f"✅ CSV gerado com {len(linhas_csv)} cultivar(s)")
+                        else:
+                            st.warning("⚠️ Nenhuma cultivar encontrada no documento")
+            
+            with col2:
+                if st.button("🔄 Limpar Processamento", use_container_width=True):
                     st.session_state.imagens_convertidas = []
                     st.session_state.texto_transcrito = ""
                     st.session_state.linhas_csv = []
-                    
-                    # 1. Converter DOCX para imagens
-                    st.info("Convertendo DOCX para imagens...")
-                    docx_bytes = uploaded_file.getvalue()
-                    imagens = converter_docx_para_imagens(docx_bytes, uploaded_file.name)
-                    
-                    if not imagens:
-                        st.error("Falha na conversão do DOCX")
-                        return
-                    
-                    st.session_state.imagens_convertidas = imagens
-                    st.success(f"✅ Convertido em {len(imagens)} página(s)")
-                    
-                    # 2. Transcrever todas as páginas
-                    st.info("Transcrevendo páginas com modelo de visão...")
-                    texto_transcrito = transcrever_todas_paginas(imagens)
-                    st.session_state.texto_transcrito = texto_transcrito
-                    
-                    # Mostrar preview da transcrição
-                    with st.expander("📝 Ver transcrição completa", expanded=False):
-                        st.text_area("Texto transcrito:", texto_transcrito[:5000] + ("..." if len(texto_transcrito) > 5000 else ""), 
-                                   height=300, key="preview_transcricao")
-                    
-                    st.success(f"✅ Transcrição concluída ({len(texto_transcrito)} caracteres)")
-                    
-                    # 3. Converter texto para CSV
-                    st.info("Gerando CSV com todas as cultivares...")
-                    linhas_csv = converter_texto_para_csv_completo(texto_transcrito)
-                    st.session_state.linhas_csv = linhas_csv
-                    
-                    if linhas_csv:
-                        st.success(f"✅ CSV gerado com {len(linhas_csv)} cultivar(s)")
-                    else:
-                        st.warning("⚠️ Nenhuma cultivar encontrada no documento")
+                    st.rerun()
     
     # Área principal para resultados
     st.header("Resultados")
@@ -397,44 +414,85 @@ def main():
                 with cols[col_idx]:
                     st.image(imagem, caption=f"Página {idx+1}", use_container_width=True)
     
+    # Mostrar transcrição se disponível
+    if st.session_state.texto_transcrito:
+        with st.expander("📝 Ver transcrição completa", expanded=False):
+            st.text_area("Texto transcrito:", st.session_state.texto_transcrito, 
+                       height=300, key="preview_transcricao")
+    
     # Mostrar CSV gerado
     if st.session_state.linhas_csv:
         st.subheader("📊 CSV Gerado")
         
-        # Cabeçalho das colunas
+        # Cabeçalho das colunas (81 colunas)
         cabecalho = """Cultura	Nome do produto	NOME TÉCNICO/ REG	Descritivo para SEO	Fertilidade	Grupo de maturação	Lançamento	Slogan	Tecnologia	Região (por extenso)	Estado (por extenso)	Ciclo	Finalidade	URL da imagem do mapa	Número do ícone	Titulo icone 1	Descrição Icone 1	Número do ícone	Titulo icone 2	Descrição Icone 2	Número do ícone	Titulo icone 3	Descrição Icone 3	Número do ícone	Título icone 4	Descrição Icone 4	Número do ícone	Título icone 5	Descrição Icone 5	Exigência à fertilidade	Grupo de maturidade	PMS MÉDIO	Tipo de crescimento	Cor da flor	Cor da pubescência	Cor do hilo	Cancro da haste	Pústula bacteriana	Nematoide das galhas - M. javanica	Nematóide de Cisto (Raça 3)	Nematóide de Cisto (Raça 9)	Nematóide de Cisto (Raça 10)	Nematóide de Cisto (Raça 14)	Fitóftora (Raça 1)	Recomendações	Resultado 1 - Nome	Resultado 1 - Local	Resultado 1	Resultado 2 - Nome	Resultado 2 - Local	Resultado 2	Resultado 3 - Nome	Resultado 3 - Local	Resultado 3	Resultado 4 - Nome	Resultado 4 - Local	Resultado 4	Resultado 5 - Nome	Resultado 5 - Local	Resultado 5	Resultado 6 - Nome	Resultado 6 - Local	Resultado 6	Resultado 7 - Nome	Resultado 7 - Local	Resultado 7	REC	UF	Região	Mês 1	Mês 2	Mês 3	Mês 4	Mês 5	Mês 6	Mês 7	Mês 8	Mês 9	Mês 10	Mês 11	Mês 12"""
         
         # Criar conteúdo CSV
         conteudo_csv = cabecalho + "\n" + "\n".join(st.session_state.linhas_csv)
         
-        # Criar DataFrame
+        # Criar DataFrame com tratamento correto
         try:
-            # Processar cada linha CSV
+            # Processar cada linha CSV e garantir 81 colunas
             todas_linhas = []
             for linha in st.session_state.linhas_csv:
                 partes = linha.split('\t')
-                # Garantir 76 colunas
-                while len(partes) < 76:
-                    partes.append("NR")
-                todas_linhas.append(partes[:76])
+                # Garantir EXATAMENTE 81 colunas
+                if len(partes) < 81:
+                    partes.extend(["NR"] * (81 - len(partes)))
+                elif len(partes) > 81:
+                    partes = partes[:81]
+                
+                todas_linhas.append(partes)
             
             # Criar DataFrame
             cabecalho_partes = cabecalho.split('\t')
+            
+            # Verificar compatibilidade
+            if len(cabecalho_partes) != 81:
+                st.warning(f"Cabeçalho tem {len(cabecalho_partes)} colunas, ajustando para 81...")
+                while len(cabecalho_partes) < 81:
+                    cabecalho_partes.append(f"Coluna_{len(cabecalho_partes)+1}")
+                cabecalho_partes = cabecalho_partes[:81]
+            
             df = pd.DataFrame(todas_linhas, columns=cabecalho_partes)
             
-            # Mostrar preview
+            # Mostrar estatísticas
             st.write(f"**Total de cultivares:** {len(df)}")
             
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Cultivares de Soja", len(df[df['Cultura'] == 'Soja']) if 'Cultura' in df.columns else 0)
+                if 'Cultura' in df.columns:
+                    soja_count = len(df[df['Cultura'] == 'Soja'])
+                    st.metric("Cultivares de Soja", soja_count)
+                else:
+                    st.metric("Cultivares", len(df))
+            
             with col2:
-                st.metric("Cultivares de Milho", len(df[df['Cultura'] == 'Milho']) if 'Cultura' in df.columns else 0)
+                if 'Grupo de maturação' in df.columns:
+                    grupos = df['Grupo de maturação'].unique()
+                    st.metric("Grupos distintos", len(grupos))
+                else:
+                    st.metric("Linhas processadas", len(df))
+            
+            with col3:
+                if 'Tecnologia' in df.columns:
+                    techs = df['Tecnologia'].unique()
+                    st.metric("Tecnologias", len(techs))
+                else:
+                    st.metric("Colunas", len(df.columns))
             
             # Visualização da tabela
             with st.expander("📋 Visualizar dados extraídos", expanded=True):
-                st.dataframe(df[['Cultura', 'Nome do produto', 'Grupo de maturação', 'Lançamento', 'Tecnologia', 'Estado (por extenso)']], 
-                           use_container_width=True, height=400)
+                # Selecionar colunas principais para visualização
+                colunas_visuais = ['Cultura', 'Nome do produto', 'Grupo de maturação', 
+                                 'Lançamento', 'Tecnologia', 'Estado (por extenso)', 
+                                 'Fertilidade', 'PMS MÉDIO']
+                colunas_disponiveis = [c for c in colunas_visuais if c in df.columns]
+                
+                if colunas_disponiveis:
+                    st.dataframe(df[colunas_disponiveis], use_container_width=True, height=400)
+                else:
+                    st.dataframe(df.iloc[:, :10], use_container_width=True, height=400)
             
             # Download
             st.subheader("📥 Download")
@@ -443,12 +501,14 @@ def main():
             
             with col_dl1:
                 # Download CSV
+                nome_base = st.session_state.uploaded_file_name.split('.')[0] if st.session_state.uploaded_file_name else "cultivares"
                 st.download_button(
-                    label="📄 Baixar CSV",
+                    label="📄 Baixar CSV (TAB)",
                     data=conteudo_csv,
-                    file_name=f"cultivares_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"{nome_base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
-                    use_container_width=True
+                    use_container_width=True,
+                    help="CSV separado por TAB com 81 colunas"
                 )
             
             with col_dl2:
@@ -461,55 +521,77 @@ def main():
                 st.download_button(
                     label="📊 Baixar Excel",
                     data=excel_data,
-                    file_name=f"cultivares_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    file_name=f"{nome_base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    use_container_width=True,
+                    help="Arquivo Excel com todas as colunas"
                 )
             
             with col_dl3:
                 # Download Texto Transcrito
-                st.download_button(
-                    label="📝 Baixar Transcrição",
-                    data=st.session_state.texto_transcrito,
-                    file_name=f"transcricao_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    use_container_width=True
-                )
+                if st.session_state.texto_transcrito:
+                    st.download_button(
+                        label="📝 Baixar Transcrição",
+                        data=st.session_state.texto_transcrito,
+                        file_name=f"transcricao_{nome_base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                        help="Texto completo transcrito do documento"
+                    )
             
             # Detalhes técnicos
             with st.expander("🔧 Detalhes técnicos", expanded=False):
                 st.write(f"**Páginas processadas:** {len(st.session_state.imagens_convertidas)}")
                 st.write(f"**Tamanho da transcrição:** {len(st.session_state.texto_transcrito):,} caracteres")
-                st.write(f"**Colunas no CSV:** {len(cabecalho_partes)}")
-                st.code(conteudo_csv[:2000], language="text")
+                st.write(f"**Colunas no CSV:** {len(df.columns)}")
+                st.write(f"**Cultivares extraídas:** {len(df)}")
+                
+                # Mostrar algumas linhas do CSV
+                st.write("**Primeiras linhas do CSV:**")
+                st.code("\n".join(conteudo_csv.split('\n')[:4]), language="text")
                 
         except Exception as e:
             st.error(f"Erro ao processar CSV: {str(e)}")
-            st.write("Conteúdo CSV bruto:")
-            st.code(conteudo_csv[:3000], language="text")
+            st.write("**Conteúdo CSV bruto (primeiras 2000 caracteres):**")
+            st.code(conteudo_csv[:2000], language="text")
+            
+            # Tentar diagnóstico
+            st.write("**Diagnóstico:**")
+            if st.session_state.linhas_csv:
+                primeira_linha = st.session_state.linhas_csv[0]
+                num_colunas = len(primeira_linha.split('\t'))
+                st.write(f"Primeira linha tem {num_colunas} colunas")
+                st.write(f"Cabeçalho tem {len(cabecalho.split('\t'))} colunas")
     
     elif st.session_state.texto_transcrito and not st.session_state.linhas_csv:
         st.warning("Texto transcrito disponível, mas nenhuma cultivar foi encontrada.")
         with st.expander("Ver texto transcrito"):
             st.text_area("Texto completo:", st.session_state.texto_transcrito, height=400)
     
-    elif not uploaded_file:
+    elif not st.session_state.uploaded_file_name:
         st.info("👈 Carregue um arquivo DOCX na barra lateral para começar")
         
         # Exemplo do fluxo
         st.markdown("""
-        ### Fluxo do Processamento:
+        ### 🚀 Fluxo do Processamento:
         
-        1. **Upload DOCX** → Carregue seu documento técnico
-        2. **Conversão para imagens** → Cada página vira uma imagem PNG
-        3. **Transcrição com IA** → Modelo de visão lê todas as imagens
-        4. **Extração para CSV** → Modelo de texto analisa e formata os dados
-        5. **Download** → Baixe o CSV com todas as colunas formatadas
+        1. **📤 Upload DOCX** → Carregue seu documento técnico
+        2. **🖼️ Conversão para imagens** → Cada página vira uma imagem PNG
+        3. **👁️ Transcrição com IA** → Modelo de visão lê TODAS as imagens
+        4. **📝 Extração para CSV** → Modelo de texto analisa e formata 81 colunas
+        5. **💾 Download** → Baixe CSV, Excel e transcrição
         
-        ### Formatos suportados:
-        - Documentos DOCX com tabelas de cultivares
-        - Catálogos técnicos de soja e milho
-        - Fichas técnicas com múltiplas cultivares
+        ### 📊 Saída Gerada:
+        - **CSV com 81 colunas** formatado com TAB
+        - **Arquivo Excel** pronto para uso
+        - **Transcrição completa** do documento
+        
+        ### ✅ Funcionalidades:
+        - Processa **TODAS** as páginas do documento
+        - Detecta **MÚLTIPLAS** cultivares por página
+        - Extrai **TODAS** as 81 colunas especificadas
+        - Compatível com **Linux** (sem necessidade de Microsoft Word)
+        - Interface amigável com feedback visual
         """)
 
 if __name__ == "__main__":
