@@ -3,19 +3,25 @@ import google.generativeai as genai
 from PIL import Image
 import io
 import pandas as pd
-import re
 import os
 from datetime import datetime
+import time
+import tempfile
+from pathlib import Path
+import docx
+from docx2pdf import convert
+import pdf2image
+import base64
 
 # Configuração da página
 st.set_page_config(
-    page_title="Extrator de Cultivares de Soja",
+    page_title="Extrator de Cultivares de DOCX",
     page_icon="🌱",
     layout="wide"
 )
 
 # Título
-st.title("Extrator de Informações de Cultivares de Soja")
+st.title("Extrator de Informações de Cultivares - DOCX para CSV")
 
 # Obter API key das variáveis de ambiente
 gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GEM_API_KEY")
@@ -27,517 +33,404 @@ if not gemini_api_key:
 try:
     genai.configure(api_key=gemini_api_key)
     modelo_vision = genai.GenerativeModel("gemini-2.0-flash")
+    modelo_texto = genai.GenerativeModel("gemini-2.0-flash")
 except Exception as e:
     st.error(f"Erro ao configurar o Gemini: {str(e)}")
     st.stop()
 
-def extrair_informacoes_imagem(imagem_bytes, nome_arquivo):
+# Função para converter DOCX para imagens
+def converter_docx_para_imagens(docx_bytes, nome_arquivo):
+    """Converte um arquivo DOCX para uma lista de imagens PNG"""
+    
+    imagens = []
+    
+    try:
+        # Criar arquivo temporário DOCX
+        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp_docx:
+            tmp_docx.write(docx_bytes)
+            tmp_docx_path = tmp_docx.name
+        
+        # Converter DOCX para PDF
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_pdf:
+            tmp_pdf_path = tmp_pdf.name
+        
+        try:
+            convert(tmp_docx_path, tmp_pdf_path)
+        except:
+            # Se docx2pdf falhar, tentar extrair texto diretamente
+            doc = docx.Document(tmp_docx_path)
+            texto = "\n".join([para.text for para in doc.paragraphs])
+            
+            # Criar uma imagem com o texto
+            from PIL import ImageDraw, ImageFont
+            img = Image.new('RGB', (800, 1200), color='white')
+            d = ImageDraw.Draw(img)
+            
+            try:
+                font = ImageFont.truetype("arial.ttf", 14)
+            except:
+                font = ImageFont.load_default()
+            
+            # Adicionar texto à imagem
+            lines = texto.split('\n')
+            y = 10
+            for line in lines[:50]:  # Limitar a 50 linhas
+                d.text((10, y), line[:100], fill='black', font=font)
+                y += 20
+            
+            imagens.append(img)
+            
+            # Limpar arquivos temporários
+            os.unlink(tmp_docx_path)
+            
+            return imagens
+        
+        # Converter PDF para imagens
+        try:
+            poppler_path = None
+            
+            # Tentar encontrar poppler no sistema
+            possible_paths = [
+                r'C:\Program Files\poppler-23.11.0\Library\bin',
+                r'C:\poppler\bin',
+                '/usr/bin',
+                '/usr/local/bin'
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    poppler_path = path
+                    break
+            
+            if poppler_path:
+                images_from_pdf = pdf2image.convert_from_path(
+                    tmp_pdf_path, 
+                    dpi=150,
+                    poppler_path=poppler_path
+                )
+            else:
+                images_from_pdf = pdf2image.convert_from_path(
+                    tmp_pdf_path, 
+                    dpi=150
+                )
+            
+            imagens.extend(images_from_pdf)
+            
+        except Exception as e:
+            st.warning(f"PDF para imagem falhou: {str(e)}")
+            
+            # Fallback: criar imagem de erro
+            img = Image.new('RGB', (800, 200), color='white')
+            from PIL import ImageDraw, ImageFont
+            d = ImageDraw.Draw(img)
+            
+            try:
+                font = ImageFont.truetype("arial.ttf", 16)
+            except:
+                font = ImageFont.load_default()
+            
+            d.text((10, 10), f"Erro na conversão: {str(e)[:50]}", fill='red', font=font)
+            d.text((10, 40), f"Arquivo: {nome_arquivo}", fill='black', font=font)
+            d.text((10, 70), "Processando texto extraído...", fill='black', font=font)
+            
+            imagens.append(img)
+        
+        # Limpar arquivos temporários
+        os.unlink(tmp_docx_path)
+        os.unlink(tmp_pdf_path)
+        
+        return imagens
+        
+    except Exception as e:
+        st.error(f"Erro na conversão DOCX: {str(e)}")
+        return []
+
+# Função para transcrever informações da imagem
+def transcrever_informacoes_imagem(imagem):
+    """Transcreve informações de uma imagem PNG"""
+    
     prompt = """
-    Você é um especialista em agricultura e culturas de soja. Analise esta imagem e extraia todas as informações técnicas sobre a cultivar de soja.
-
-    A imagem contém informações sobre cultivares de soja. Extraia os seguintes dados:
-
-    ### INFORMAÇÕES PRINCIPAIS:
-    1. **Nome do produto** (ex: NS7524IPRO, NS6595I2X, etc.)
-    2. **Exigência à fertilidade** (Alto, Médio, Baixo)
-    3. **Grupo de maturação** (ex: 7.5, 6.5, etc.)
-    4. **É lançamento?** (Sim ou Não)
-    5. **Slogan/Descrição principal**
-    6. **Tecnologia** (ex: IPRO, I2X, etc.)
-    7. **Estados recomendados** (lista completa)
-    8. **Benefícios/Características principais** (lista de 3-5 itens)
-
-    ### INFORMAÇÕES FENOTÍPICAS:
-    9. **PMS MÉDIO** (Peso de Mil Sementes)
-    10. **Tipo de crescimento** (Indeterminado, Semideterminado, Determinado)
-    11. **Cor da flor**
-    12. **Cor da pubescência**
-    13. **Cor do hilo**
-
-    ### TOLERÂNCIA A DOENÇAS:
-    Para cada doença, classifique como: S (Suscetível), MS (Mod. Suscetível), MR (Mod. Resistente), R (Resistente), X (Resistente)
-    14. **Cancro da haste**
-    15. **Pústula bacteriana**
-    16. **Nematoide das galhas - M. javanica**
-    17. **Nematóide de Cisto (Raça 3)**
-    18. **Nematóide de Cisto (Raça 9)**
-    19. **Nematóide de Cisto (Raça 10)**
-    20. **Nematóide de Cisto (Raça 14)**
-    21. **Fitóftora (Raça 1)**
-
-    ### RESULTADOS (se houver na imagem):
-    22. Extraia até 7 resultados com: Nome, Local, Produtividade (ex: 106,0 sc/ha)
-
-    ### ÉPOCA DE SEMEADURA:
-    23. Extraia os meses de semeadura recomendados
-
-    IMPORTANTE:
-    - Forneça as informações em formato estruturado
-    - Se uma informação não estiver disponível, use "NR" (Não informado)
-    - Para tecnologias: I2X significa Intacta 2 Xtend, IPRO é Intacta PRO
-    - Para grupos de maturação: se houver variação por região (ex: 7.7 M3 | 7.8 M4), mantenha exatamente como está
-    - Para estados: escreva por extenso separados por vírgula
-
-    Formato de resposta:
-    NOME_DO_PRODUTO: [valor]
-    FERTILIDADE: [valor]
-    GRUPO_MATURACAO: [valor]
-    LANCAMENTO: [Sim/Não]
-    SLOGAN: [valor]
-    TECNOLOGIA: [valor]
-    ESTADOS: [valor]
-    BENEFICIOS: [item1; item2; item3]
-    PMS_MEDIO: [valor]
-    TIPO_CRESCIMENTO: [valor]
-    COR_FLOR: [valor]
-    COR_PUBESCENCIA: [valor]
-    COR_HILO: [valor]
-    CANCRO_HASTE: [valor]
-    PUSTULA_BACTERIANA: [valor]
-    NEMATOIDE_GALHAS: [valor]
-    NEMATOIDE_CISTO_R3: [valor]
-    NEMATOIDE_CISTO_R9: [valor]
-    NEMATOIDE_CISTO_R10: [valor]
-    NEMATOIDE_CISTO_R14: [valor]
-    FITOFTORA_R1: [valor]
-    RESULTADOS: [Nome1, Local1, Prod1; Nome2, Local2, Prod2; ...]
-    MESES_SEMEADURA: [mes1, mes2, mes3, ...]
+    Você é um especialista em agricultura. 
+    Analise esta imagem e transcreva TODAS as informações técnicas sobre a cultivar.
+    
+    Esta imagem foi convertida de um documento DOCX. Transcreva TUDO que você ver, incluindo:
+    - Cultura (Soja, Milho, ou outra)
+    - Nome do produto/cultivar
+    - Exigência à fertilidade
+    - Grupo de maturação
+    - Se é lançamento ou não
+    - Slogan ou descrição principal
+    - Tecnologia utilizada
+    - Estados recomendados
+    - Benefícios e características
+    - PMS (Peso de Mil Sementes) - se for soja
+    - Tipo de crescimento - se for soja
+    - Cor da flor, pubescência e hilo - se for soja
+    - Tolerância a doenças (tabela completa)
+    - Resultados de produtividade
+    - Época de semeadura
+    - Mapas de recomendação
+    - Qualquer outro texto ou informação presente
+    
+    IMPORTANTE: 
+    1. Transcreva FIELMENTE tudo o que está escrito na imagem.
+    2. Esta imagem veio de um DOCX, então pode ter formatação de tabelas.
+    3. Não interprete, não resuma, apenas transcreva o texto exatamente como aparece.
+    4. Se houver tabelas, transcreva-as completamente com todas as linhas e colunas.
+    5. Se houver listas, transcreva todos os itens.
+    6. Inclua cabeçalhos, títulos, subtítulos.
     """
     
     try:
+        # Converter imagem para bytes
+        img_byte_arr = io.BytesIO()
+        imagem.save(img_byte_arr, format='PNG')
+        img_byte_arr = img_byte_arr.getvalue()
+        
         response = modelo_vision.generate_content([
             prompt,
-            {"mime_type": "image/jpeg", "data": imagem_bytes}
+            {"mime_type": "image/png", "data": img_byte_arr}
         ])
         
         return response.text
     except Exception as e:
-        return f"ERRO_NA_EXTRACAO: {str(e)}"
+        return f"ERRO_NA_TRANSCRICAO: {str(e)}"
 
-def processar_texto_extraido(texto_extraido, nome_arquivo):
-    dados = {
-        'Cultura': 'Soja',
-        'Nome do produto': 'NR',
-        'NOME TÉCNICO/ REG': 'NR',
-        'Descritivo para SEO': 'NR',
-        'Fertilidade': 'NR',
-        'Grupo de maturação': 'NR',
-        'Lançamento': 'NR',
-        'Slogan': 'NR',
-        'Tecnologia': 'NR',
-        'Região (por extenso)': 'NR',
-        'Estado (por extenso)': 'NR',
-        'Ciclo': 'NR',
-        'Finalidade': 'Grãos',
-        'URL da imagem do mapa': 'NR',
-        'Número do ícone 1': '1',
-        'Titulo icone 1': 'NR',
-        'Descrição Icone 1': 'NR',
-        'Número do ícone 2': '2',
-        'Titulo icone 2': 'NR',
-        'Descrição Icone 2': 'NR',
-        'Número do ícone 3': '3',
-        'Título icone 3': 'NR',
-        'Descrição Icone 3': 'NR',
-        'Número do ícone 4': '4',
-        'Título icone 4': 'NR',
-        'Descrição Icone 4': 'NR',
-        'Número do ícone 5': '5',
-        'Título icone 5': 'NR',
-        'Descrição Icone 5': 'NR',
-        'Exigência à fertilidade': 'NR',
-        'Grupo de maturidade': 'NR',
-        'PMS MÉDIO': 'NR',
-        'Tipo de crescimento': 'NR',
-        'Cor da flor': 'NR',
-        'Cor da pubescência': 'NR',
-        'Cor do hilo': 'NR',
-        'Cancro da haste': 'NR',
-        'Pústula bacteriana': 'NR',
-        'Nematoide das galhas - M. javanica': 'NR',
-        'Nematóide de Cisto (Raça 3)': 'NR',
-        'Nematóide de Cisto (Raça 9)': 'NR',
-        'Nematóide de Cisto (Raça 10)': 'NR',
-        'Nematóide de Cisto (Raça 14)': 'NR',
-        'Fitóftora (Raça 1)': 'NR',
-        'Recomendações': 'Pode haver variação no ciclo (dias) devido às condições edafoclimáticas, época de plantio e manejo aplicado. Recomendações de população final de plantas e de época de semeadura foram construídas com base em resultados de experimentos próprios conduzidos na região e servem como direcionamento da população ideal de plantas para cada talhão. Deve-se levar em consideração: condições edafoclimáticas; textura; fertilidade do solo; adubação; nível de manejo; germinação; vigor da semente; umidade do solo entre outros fatores. Consultar recomendação de Zoneamento Agrícola de Risco Climático para a cultura de acordo com Ministério da Agricultura, Pecuária e Abastecimento.',
-        'Resultado 1 - Nome': 'NR',
-        'Resultado 1 - Local': 'NR',
-        'Resultado 1': 'NR',
-        'Resultado 2 - Nome': 'NR',
-        'Resultado 2 - Local': 'NR',
-        'Resultado 2': 'NR',
-        'Resultado 3 - Nome': 'NR',
-        'Resultado 3 - Local': 'NR',
-        'Resultado 3': 'NR',
-        'Resultado 4 - Nome': 'NR',
-        'Resultado 4 - Local': 'NR',
-        'Resultado 4': 'NR',
-        'Resultado 5 - Nome': 'NR',
-        'Resultado 5 - Local': 'NR',
-        'Resultado 5': 'NR',
-        'Resultado 6 - Nome': 'NR',
-        'Resultado 6 - Local': 'NR',
-        'Resultado 6': 'NR',
-        'Resultado 7 - Nome': 'NR',
-        'Resultado 7 - Local': 'NR',
-        'Resultado 7': 'NR',
-        'REC': 'NR',
-        'UF': 'NR',
-        'Região': 'NR',
-        'Mês 1': 'NR',
-        'Mês 2': 'NR',
-        'Mês 3': 'NR',
-        'Mês 4': 'NR',
-        'Mês 5': 'NR',
-        'Mês 6': 'NR',
-        'Mês 7': 'NR',
-        'Mês 8': 'NR',
-        'Mês 9': 'NR',
-        'Mês 10': 'NR',
-        'Mês 11': 'NR',
-        'Mês 12': 'NR'
-    }
+# Função para converter texto em CSV no formato especificado
+def converter_texto_para_csv(texto_transcrito, pagina_num):
+    """Converte texto transcrito para linha CSV"""
     
-    estado_map = {
-        'PR': 'Paraná',
-        'SC': 'Santa Catarina', 
-        'RS': 'Rio Grande do Sul',
-        'SP': 'São Paulo',
-        'MG': 'Minas Gerais',
-        'MS': 'Mato Grosso do Sul',
-        'GO': 'Goiás',
-        'MT': 'Mato Grosso',
-        'DF': 'Distrito Federal',
-        'BA': 'Bahia',
-        'TO': 'Tocantins',
-        'MA': 'Maranhão',
-        'PI': 'Piauí',
-        'RO': 'Rondônia',
-        'PA': 'Pará',
-        'SE': 'Sergipe',
-        'AL': 'Alagoas',
-        'PE': 'Pernambuco',
-        'PB': 'Paraíba',
-        'RN': 'Rio Grande do Norte',
-        'CE': 'Ceará',
-        'RR': 'Roraima',
-        'AP': 'Amapá',
-        'AM': 'Amazonas',
-        'AC': 'Acre'
-    }
-    
-    if texto_extraido.startswith("ERRO_NA_EXTRACAO"):
-        codigo_match = re.search(r'NS\d+[A-Z]*', nome_arquivo.upper())
-        if codigo_match:
-            dados['Nome do produto'] = codigo_match.group(0)
-            dados['NOME TÉCNICO/ REG'] = codigo_match.group(0)
-        return dados, texto_extraido
-    
-    linhas = texto_extraido.split('\n')
-    texto_bruto = texto_extraido
-    
-    for linha in linhas:
-        linha = linha.strip()
-        
-        if linha.startswith('NOME_DO_PRODUTO:'):
-            valor = linha.replace('NOME_DO_PRODUTO:', '').strip()
-            dados['Nome do produto'] = valor
-            dados['NOME TÉCNICO/ REG'] = valor
-            dados['Descritivo para SEO'] = f'{valor} - Cultivar de soja de alto desempenho'
-        
-        elif linha.startswith('FERTILIDADE:'):
-            valor = linha.replace('FERTILIDADE:', '').strip()
-            dados['Fertilidade'] = valor
-            dados['Exigência à fertilidade'] = valor
-        
-        elif linha.startswith('GRUPO_MATURACAO:'):
-            valor = linha.replace('GRUPO_MATURACAO:', '').strip()
-            dados['Grupo de maturação'] = valor
-            dados['Grupo de maturidade'] = valor
-        
-        elif linha.startswith('LANCAMENTO:'):
-            valor = linha.replace('LANCAMENTO:', '').strip()
-            dados['Lançamento'] = 'Sim' if 'Sim' in valor else 'Não'
-        
-        elif linha.startswith('SLOGAN:'):
-            valor = linha.replace('SLOGAN:', '').strip()
-            dados['Slogan'] = valor
-        
-        elif linha.startswith('TECNOLOGIA:'):
-            valor = linha.replace('TECNOLOGIA:', '').strip()
-            dados['Tecnologia'] = valor
-        
-        elif linha.startswith('ESTADOS:'):
-            valor = linha.replace('ESTADOS:', '').strip()
-            valor = valor.replace('Estados:', '').replace('Estado:', '').strip()
-            
-            estados_raw = re.split(r'[,;]|\be\b', valor)
-            estados = []
-            for estado in estados_raw:
-                estado = estado.strip()
-                if estado:
-                    estados.append(estado)
-            
-            estados_completos = []
-            for estado in estados:
-                estado_limpo = estado.upper().replace('.', '').strip()
-                if estado_limpo in estado_map:
-                    estados_completos.append(estado_map[estado_limpo])
-                else:
-                    if estado.title() in estado_map.values():
-                        estados_completos.append(estado.title())
-                    else:
-                        estados_completos.append(estado)
-            
-            dados['Estado (por extenso)'] = ', '.join(estados_completos)
-            
-            regiao_sul = {'Paraná', 'Santa Catarina', 'Rio Grande do Sul'}
-            regiao_sudeste = {'São Paulo', 'Minas Gerais', 'Espírito Santo', 'Rio de Janeiro'}
-            regiao_centro_oeste = {'Mato Grosso', 'Mato Grosso do Sul', 'Goiás', 'Distrito Federal'}
-            regiao_nordeste = {'Bahia', 'Maranhão', 'Piauí', 'Sergipe', 'Alagoas', 'Pernambuco', 'Paraíba', 'Rio Grande do Norte', 'Ceará'}
-            regiao_norte = {'Pará', 'Rondônia', 'Tocantins', 'Roraima', 'Amapá', 'Amazonas', 'Acre'}
-            
-            regioes = []
-            estados_set = set([e.strip() for e in estados_completos])
-            
-            if estados_set.intersection(regiao_sul):
-                regioes.append('Sul')
-            if estados_set.intersection(regiao_sudeste):
-                regioes.append('Sudeste')
-            if estados_set.intersection(regiao_centro_oeste):
-                regioes.append('Centro-Oeste')
-            if estados_set.intersection(regiao_nordeste):
-                regioes.append('Nordeste')
-            if estados_set.intersection(regiao_norte):
-                regioes.append('Norte')
-            
-            dados['Região (por extenso)'] = ', '.join(regioes) if regioes else 'NR'
-            
-            uf_list = []
-            for estado in estados_completos:
-                for sigla, nome in estado_map.items():
-                    if nome == estado:
-                        uf_list.append(sigla)
-                        break
-            dados['UF'] = ', '.join(uf_list) if uf_list else 'NR'
-            dados['Região'] = ', '.join(regioes) if regioes else 'NR'
-        
-        elif linha.startswith('BENEFICIOS:'):
-            valor = linha.replace('BENEFICIOS:', '').strip()
-            beneficios = [b.strip() for b in valor.split(';') if b.strip()]
-            
-            titulos_icones = [
-                'Alto retorno ao investimento',
-                'Facilidade do plantio à colheita',
-                'Estabilidade produtiva',
-                'Multi resistência',
-                'Sanidade foliar'
-            ]
-            
-            for i, beneficio in enumerate(beneficios[:5]):
-                dados[f'Título icone {i+1}'] = titulos_icones[i] if i < len(titulos_icones) else f'Benefício {i+1}'
-                dados[f'Descrição Icone {i+1}'] = beneficio
-        
-        elif linha.startswith('PMS_MEDIO:'):
-            valor = linha.replace('PMS_MEDIO:', '').strip()
-            dados['PMS MÉDIO'] = valor
-        
-        elif linha.startswith('TIPO_CRESCIMENTO:'):
-            valor = linha.replace('TIPO_CRESCIMENTO:', '').strip()
-            dados['Tipo de crescimento'] = valor
-        
-        elif linha.startswith('COR_FLOR:'):
-            valor = linha.replace('COR_FLOR:', '').strip()
-            dados['Cor da flor'] = valor
-        
-        elif linha.startswith('COR_PUBESCENCIA:'):
-            valor = linha.replace('COR_PUBESCENCIA:', '').strip()
-            dados['Cor da pubescência'] = valor
-        
-        elif linha.startswith('COR_HILO:'):
-            valor = linha.replace('COR_HILO:', '').strip()
-            dados['Cor do hilo'] = valor
-        
-        elif linha.startswith('CANCRO_HASTE:'):
-            dados['Cancro da haste'] = linha.replace('CANCRO_HASTE:', '').strip()
-        elif linha.startswith('PUSTULA_BACTERIANA:'):
-            dados['Pústula bacteriana'] = linha.replace('PUSTULA_BACTERIANA:', '').strip()
-        elif linha.startswith('NEMATOIDE_GALHAS:'):
-            dados['Nematoide das galhas - M. javanica'] = linha.replace('NEMATOIDE_GALHAS:', '').strip()
-        elif linha.startswith('NEMATOIDE_CISTO_R3:'):
-            dados['Nematóide de Cisto (Raça 3)'] = linha.replace('NEMATOIDE_CISTO_R3:', '').strip()
-        elif linha.startswith('NEMATOIDE_CISTO_R9:'):
-            dados['Nematóide de Cisto (Raça 9)'] = linha.replace('NEMATOIDE_CISTO_R9:', '').strip()
-        elif linha.startswith('NEMATOIDE_CISTO_R10:'):
-            dados['Nematóide de Cisto (Raça 10)'] = linha.replace('NEMATOIDE_CISTO_R10:', '').strip()
-        elif linha.startswith('NEMATOIDE_CISTO_R14:'):
-            dados['Nematóide de Cisto (Raça 14)'] = linha.replace('NEMATOIDE_CISTO_R14:', '').strip()
-        elif linha.startswith('FITOFTORA_R1:'):
-            dados['Fitóftora (Raça 1)'] = linha.replace('FITOFTORA_R1:', '').strip()
-        
-        elif linha.startswith('RESULTADOS:'):
-            valor = linha.replace('RESULTADOS:', '').strip()
-            if valor and valor != 'NR' and ';' in valor:
-                resultados = [r.strip() for r in valor.split(';') if r.strip()]
-                for i, resultado in enumerate(resultados[:7], 1):
-                    partes = [p.strip() for p in resultado.split(',')]
-                    if len(partes) >= 3:
-                        dados[f'Resultado {i} - Nome'] = partes[0]
-                        dados[f'Resultado {i} - Local'] = partes[1]
-                        dados[f'Resultado {i}'] = partes[2]
-        
-        elif linha.startswith('MESES_SEMEADURA:'):
-            valor = linha.replace('MESES_SEMEADURA:', '').strip()
-            if valor and valor != 'NR':
-                meses = [m.strip().lower() for m in valor.split(',') if m.strip()]
-                meses_numeros = {
-                    'janeiro': 1, 'fevereiro': 2, 'março': 3, 'marco': 3,
-                    'abril': 4, 'maio': 5, 'junho': 6, 'julho': 7,
-                    'agosto': 8, 'setembro': 9, 'outubro': 10,
-                    'novembro': 11, 'dezembro': 12
-                }
-                
-                for mes_nome in meses:
-                    mes_chave = mes_nome.lower()
-                    if mes_chave in meses_numeros:
-                        num_mes = meses_numeros[mes_chave]
-                        dados[f'Mês {num_mes}'] = '180-260'
-    
-    return dados, texto_bruto
+    prompt = f"""
+    Você recebeu uma transcrição de informações sobre uma cultivar.
+    Converta essas informações para o formato CSV especificado abaixo.
 
-def processar_imagem(imagem_bytes, nome_arquivo, idx, total):
-    with st.spinner(f"Processando imagem {idx}/{total}: {nome_arquivo[:30]}..."):
+    TEXTO TRANSCRITO (página {pagina_num}):
+    {texto_transcrito[:8000]}
+
+    FORMATO CSV REQUERIDO (colunas separadas por TAB):
+    Cultura	Nome do produto	NOME TÉCNICO/ REG	Descritivo para SEO	Fertilidade	Grupo de maturação	Lançamento	Slogan	Tecnologia	Região (por extenso)	Estado (por extenso)	Ciclo	Finalidade	URL da imagem do mapa	Número do ícone	Titulo icone 1	Descrição Icone 1	Número do ícone	Titulo icone 2	Descrição Icone 2	Número do ícone	Titulo icone 3	Descrição Icone 3	Número do ícone	Título icone 4	Descrição Icone 4	Número do ícone	Título icone 5	Descrição Icone 5	Exigência à fertilidade	Grupo de maturidade	PMS MÉDIO	Tipo de crescimento	Cor da flor	Cor da pubescência	Cor do hilo	Cancro da haste	Pústula bacteriana	Nematoide das galhas - M. javanica	Nematóide de Cisto (Raça 3)	Nematóide de Cisto (Raça 9)	Nematóide de Cisto (Raça 10)	Nematóide de Cisto (Raça 14)	Fitóftora (Raça 1)	Recomendações	Resultado 1 - Nome	Resultado 1 - Local	Resultado 1	Resultado 2 - Nome	Resultado 2 - Local	Resultado 2	Resultado 3 - Nome	Resultado 3 - Local	Resultado 3	Resultado 4 - Nome	Resultado 4 - Local	Resultado 4	Resultado 5 - Nome	Resultado 5 - Local	Resultado 5	Resultado 6 - Nome	Resultado 6 - Local	Resultado 6	Resultado 7 - Nome	Resultado 7 - Local	Resultado 7	REC	UF	Região	Mês 1	Mês 2	Mês 3	Mês 4	Mês 5	Mês 6	Mês 7	Mês 8	Mês 9	Mês 10	Mês 11	Mês 12
+
+    INSTRUÇÕES DE PREENCHIMENTO:
+
+    1. CULTURA: "Soja" ou "Milho" (extraia do texto)
+    2. NOME DO PRODUTO: Extraia o nome da cultivar (ex: NS7524IPRO, NS6595I2X)
+    3. NOME TÉCNICO/REG: Mesmo que nome do produto
+    4. DESCRITIVO PARA SEO: Crie uma descrição breve para SEO baseada nas informações
+    5. FERTILIDADE: Alto, Médio ou Baixo (extraia do texto)
+    6. GRUPO DE MATURAÇÃO: Número (ex: 7.5, 6.5) - se for soja
+    7. LANÇAMENTO: "Sim" ou "Não" (procure por palavras como "lançamento", "nova")
+    8. SLOGAN: Frase principal de marketing
+    9. TECNOLOGIA: IPRO, I2X, ou outra mencionada
+    10. REGIÃO (POR EXTENSO): Sul, Sudeste, Centro-Oeste, Nordeste, Norte (baseado nos estados)
+    11. ESTADO (POR EXTENSO): Nomes completos dos estados recomendados
+    12. CICLO: Precoce, Médio, Tardio (ou estimativa baseada no grupo de maturação)
+    13. FINALIDADE: "Grãos"
+    14. URL DA IMAGEM DO MAPA: "NR"
+    15. ÍCONES 1-5: Extraia os principais benefícios do texto
+    16. EXIGÊNCIA À FERTILIDADE: Mesmo que "Fertilidade"
+    17. GRUPO DE MATURIDADE: Mesmo que "Grupo de maturação"
+    18. PMS MÉDIO: Extraia o peso de mil sementes (ex: 150G, 165g) - se for soja, senão "NR"
+    19. TIPO DE CRESCIMENTO: Indeterminado, Semideterminado, Determinado - se for soja, senão "NR"
+    20. CORES: Flor, pubescência, hilo - se for soja, senão "NR"
+    21. DOENÇAS: S (Suscetível), MS (Mod. Suscetível), MR (Mod. Resistente), R (Resistente), X (Resistente) - se for soja, senão "NR"
+    22. RECOMENDAÇÕES: Use o texto padrão se não houver específico
+    23. RESULTADOS: Extraia até 7 resultados de produtividade se houver
+    24. REC: "NR"
+    25. UF: Siglas dos estados (PR, SC, RS, etc.)
+    26. REGIÃO: Mesmo que "Região (por extenso)"
+    27. MESES: Para meses com semeadura recomendada, preencha com "180-260", outros "NR"
+
+    REGRAS:
+    - Use "NR" para informações não encontradas
+    - Para estados: converta siglas para nomes completos
+    - Para regiões: Sul (PR, SC, RS), Sudeste (SP, MG, RJ, ES), Centro-Oeste (MT, MS, GO, DF), Nordeste (BA, MA, PI, etc.), Norte (PA, RO, TO, etc.)
+    - Para meses: janeiro=1, fevereiro=2, etc.
+    - Mantenha valores exatos como aparecem (ex: 7.7 M3 | 7.8 M4 | 7.8 M5)
+    - Se for milho, colunas específicas de soja ficam como "NR"
+    - Se não conseguir extrair informações suficientes, retorne APENAS "ERRO"
+    
+    Forneça APENAS a linha CSV no formato especificado, sem cabeçalho, sem explicações.
+    Separe os valores por TAB (\t).
+    """
+    
+    try:
+        response = modelo_texto.generate_content(prompt)
+        linha_csv = response.text.strip()
+        
+        # Verificar se é uma linha CSV válida e não é "ERRO"
+        if linha_csv != "ERRO" and '\t' in linha_csv and len(linha_csv.split('\t')) > 10:
+            return linha_csv
+        else:
+            return ""
+            
+    except Exception as e:
+        return ""
+
+# Processar uma imagem (página do DOCX)
+def processar_imagem_pagina(imagem, pagina_num, total_paginas):
+    """Processa uma imagem (página convertida do DOCX)"""
+    
+    with st.spinner(f"Transcrevendo página {pagina_num}/{total_paginas}..."):
         try:
-            image = Image.open(io.BytesIO(imagem_bytes))
+            # Passo 1: Transcrever informações da imagem
+            texto_transcrito = transcrever_informacoes_imagem(imagem)
             
-            texto_extraido = extrair_informacoes_imagem(imagem_bytes, nome_arquivo)
-            dados, texto_bruto = processar_texto_extraido(texto_extraido, nome_arquivo)
-            status = "✅"
+            # Passo 2: Converter texto para CSV
+            with st.spinner(f"Convertendo página {pagina_num}/{total_paginas} para CSV..."):
+                time.sleep(1)
+                linha_csv = converter_texto_para_csv(texto_transcrito, pagina_num)
             
-            return {
-                'nome_arquivo': nome_arquivo,
-                'dados': dados,
-                'texto_bruto': texto_bruto,
-                'imagem': image,
-                'status': status
-            }
+            if linha_csv:
+                return {
+                    'pagina_num': pagina_num,
+                    'imagem': imagem,
+                    'texto_transcrito': texto_transcrito,
+                    'linha_csv': linha_csv,
+                    'status': '✅'
+                }
+            else:
+                return {
+                    'pagina_num': pagina_num,
+                    'imagem': imagem,
+                    'texto_transcrito': texto_transcrito,
+                    'linha_csv': '',
+                    'status': '❌ (Falha na conversão)'
+                }
             
         except Exception as e:
             return {
-                'nome_arquivo': nome_arquivo,
-                'dados': {'Nome do produto': 'ERRO'},
-                'texto_bruto': f"ERRO: {str(e)}",
+                'pagina_num': pagina_num,
                 'imagem': None,
-                'status': f"❌ {str(e)[:50]}"
+                'texto_transcrito': f"ERRO: {str(e)}",
+                'linha_csv': '',
+                'status': f'❌ (Erro: {str(e)[:30]})'
             }
 
-# Interface principal
-if 'resultados_processamento' not in st.session_state:
-    st.session_state.resultados_processamento = []
-if 'dados_consolidados' not in st.session_state:
-    st.session_state.dados_consolidados = pd.DataFrame()
+# Interface
+if 'resultados' not in st.session_state:
+    st.session_state.resultados = []
+if 'linhas_csv' not in st.session_state:
+    st.session_state.linhas_csv = []
+if 'imagens_convertidas' not in st.session_state:
+    st.session_state.imagens_convertidas = []
 
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    uploaded_files = st.file_uploader(
-        "Carregue uma ou mais imagens:",
-        type=["jpg", "jpeg", "png", "bmp", "webp", "gif"],
-        accept_multiple_files=True
+    uploaded_file = st.file_uploader(
+        "Carregue um arquivo DOCX:",
+        type=["docx"],
+        accept_multiple_files=False
     )
     
-    if uploaded_files:
-        st.write(f"{len(uploaded_files)} imagem(ns) carregada(s)")
+    if uploaded_file:
+        st.write(f"Arquivo: {uploaded_file.name}")
+        st.write(f"Tamanho: {uploaded_file.size / 1024:.1f} KB")
         
-        if st.button("Processar Todas as Imagens", type="primary"):
-            st.session_state.resultados_processamento = []
+        if st.button("Processar DOCX", type="primary"):
+            st.session_state.resultados = []
+            st.session_state.linhas_csv = []
+            st.session_state.imagens_convertidas = []
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            # Converter DOCX para imagens
+            with st.spinner("Convertendo DOCX para imagens..."):
+                docx_bytes = uploaded_file.getvalue()
+                imagens = converter_docx_para_imagens(docx_bytes, uploaded_file.name)
+                st.session_state.imagens_convertidas = imagens
             
-            resultados = []
-            for idx, uploaded_file in enumerate(uploaded_files):
-                status_text.text(f"Processando {idx+1}/{len(uploaded_files)}: {uploaded_file.name}")
-                progress_bar.progress((idx + 1) / len(uploaded_files))
+            if imagens:
+                st.write(f"Documento convertido em {len(imagens)} página(s)")
                 
-                resultado = processar_imagem(
-                    uploaded_file.getvalue(),
-                    uploaded_file.name,
-                    idx + 1,
-                    len(uploaded_files)
-                )
-                resultados.append(resultado)
-            
-            progress_bar.empty()
-            status_text.empty()
-            
-            st.session_state.resultados_processamento = resultados
-            
-            if resultados:
-                dados_list = [r['dados'] for r in resultados if 'dados' in r]
-                if dados_list:
-                    st.session_state.dados_consolidados = pd.DataFrame(dados_list)
-            
-            st.write(f"{len(resultados)} imagem(ns) processada(s)")
+                # Processar cada imagem (página)
+                resultados = []
+                for idx, imagem in enumerate(imagens):
+                    resultado = processar_imagem_pagina(
+                        imagem,
+                        idx + 1,
+                        len(imagens)
+                    )
+                    resultados.append(resultado)
+                    
+                    # Adicionar linha CSV se válida
+                    if resultado['linha_csv']:
+                        st.session_state.linhas_csv.append(resultado['linha_csv'])
+                
+                st.session_state.resultados = resultados
+                
+                sucesso = sum(1 for r in resultados if '✅' in r['status'])
+                st.write(f"Processado: {sucesso}/{len(imagens)} página(s) com sucesso")
+            else:
+                st.error("Falha na conversão do DOCX para imagens")
 
 with col2:
-    if st.session_state.resultados_processamento:
-        col_res1, col_res2 = st.columns(2)
-        with col_res1:
-            st.write(f"Imagens Processadas: {len(st.session_state.resultados_processamento)}")
-        with col_res2:
-            sucesso = sum(1 for r in st.session_state.resultados_processamento if '✅' in r.get('status', ''))
-            st.write(f"Processadas com Sucesso: {sucesso}")
+    if st.session_state.imagens_convertidas:
+        st.write(f"Páginas convertidas: {len(st.session_state.imagens_convertidas)}")
         
-        for idx, resultado in enumerate(st.session_state.resultados_processamento):
-            col_img, col_info, col_status = st.columns([2, 3, 1])
-            
-            with col_img:
-                if resultado.get('imagem'):
-                    st.image(resultado['imagem'], 
-                           caption=f"{resultado['nome_arquivo'][:30]}...", 
-                           width=100)
-                else:
-                    st.write("🖼️")
-            
-            with col_info:
-                nome_produto = resultado['dados'].get('Nome do produto', 'N/A')
-                st.write(f"{nome_produto}")
-                st.write(f"Arquivo: {resultado['nome_arquivo'][:40]}")
+        # Mostrar preview das primeiras 3 páginas
+        cols = st.columns(min(3, len(st.session_state.imagens_convertidas)))
+        for idx, imagem in enumerate(st.session_state.imagens_convertidas[:3]):
+            with cols[idx]:
+                st.image(imagem, caption=f"Página {idx+1}", use_container_width=True)
+    
+    if st.session_state.resultados:
+        # Mostrar resumo do processamento
+        st.write("Resultados do processamento:")
+        
+        for resultado in st.session_state.resultados:
+            col_status, col_info = st.columns([1, 4])
             
             with col_status:
-                st.write(resultado['status'])
+                st.write(f"{resultado['status']}")
+            
+            with col_info:
+                st.write(f"Página {resultado['pagina_num']}")
+                
+                if resultado['texto_transcrito']:
+                    with st.expander(f"Ver transcrição página {resultado['pagina_num']}"):
+                        st.text_area("", resultado['texto_transcrito'][:500] + "...", 
+                                   height=100, key=f"transc_{resultado['pagina_num']}")
+                
+                if resultado['linha_csv']:
+                    with st.expander(f"Ver linha CSV página {resultado['pagina_num']}"):
+                        st.code(resultado['linha_csv'])
         
-        if not st.session_state.dados_consolidados.empty:
-            st.dataframe(st.session_state.dados_consolidados, 
-                       use_container_width=True,
-                       height=400)
+        # Gerar CSV completo
+        if st.session_state.linhas_csv:
+            # Cabeçalho das colunas
+            cabecalho = """Cultura	Nome do produto	NOME TÉCNICO/ REG	Descritivo para SEO	Fertilidade	Grupo de maturação	Lançamento	Slogan	Tecnologia	Região (por extenso)	Estado (por extenso)	Ciclo	Finalidade	URL da imagem do mapa	Número do ícone	Titulo icone 1	Descrição Icone 1	Número do ícone	Titulo icone 2	Descrição Icone 2	Número do ícone	Titulo icone 3	Descrição Icone 3	Número do ícone	Título icone 4	Descrição Icone 4	Número do ícone	Título icone 5	Descrição Icone 5	Exigência à fertilidade	Grupo de maturidade	PMS MÉDIO	Tipo de crescimento	Cor da flor	Cor da pubescência	Cor do hilo	Cancro da haste	Pústula bacteriana	Nematoide das galhas - M. javanica	Nematóide de Cisto (Raça 3)	Nematóide de Cisto (Raça 9)	Nematóide de Cisto (Raça 10)	Nematóide de Cisto (Raça 14)	Fitóftora (Raça 1)	Recomendações	Resultado 1 - Nome	Resultado 1 - Local	Resultado 1	Resultado 2 - Nome	Resultado 2 - Local	Resultado 2	Resultado 3 - Nome	Resultado 3 - Local	Resultado 3	Resultado 4 - Nome	Resultado 4 - Local	Resultado 4	Resultado 5 - Nome	Resultado 5 - Local	Resultado 5	Resultado 6 - Nome	Resultado 6 - Local	Resultado 6	Resultado 7 - Nome	Resultado 7 - Local	Resultado 7	REC	UF	Região	Mês 1	Mês 2	Mês 3	Mês 4	Mês 5	Mês 6	Mês 7	Mês 8	Mês 9	Mês 10	Mês 11	Mês 12"""
             
-            col_exp1, col_exp2 = st.columns(2)
+            # Criar conteúdo CSV
+            conteudo_csv = cabecalho + "\n" + "\n".join(st.session_state.linhas_csv)
             
-            with col_exp1:
-                csv_data = st.session_state.dados_consolidados.to_csv(index=False, sep=';', encoding='utf-8-sig')
+            # Converter para DataFrame para visualização
+            linhas = [cabecalho.split('\t')] + [linha.split('\t') for linha in st.session_state.linhas_csv if linha]
+            df = pd.DataFrame(linhas[1:], columns=linhas[0])
+            
+            st.write("CSV Gerado:")
+            st.dataframe(df, use_container_width=True, height=400)
+            
+            # Botões de download
+            col_dl1, col_dl2 = st.columns(2)
+            
+            with col_dl1:
                 st.download_button(
                     label="Baixar CSV",
-                    data=csv_data,
-                    file_name=f"cultivares_soja_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    data=conteudo_csv,
+                    file_name=f"cultivares_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
             
-            with col_exp2:
+            with col_dl2:
                 excel_buffer = io.BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                    st.session_state.dados_consolidados.to_excel(writer, index=False, sheet_name='Cultivares')
+                    df.to_excel(writer, index=False, sheet_name='Cultivares')
                 excel_data = excel_buffer.getvalue()
                 
                 st.download_button(
                     label="Baixar Excel",
                     data=excel_data,
-                    file_name=f"cultivares_soja_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    file_name=f"cultivares_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
-
-st.write(f"Extrator de Cultivares de Soja | {datetime.now().strftime('%d/%m/%Y %H:%M')}")
