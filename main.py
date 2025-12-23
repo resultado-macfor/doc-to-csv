@@ -7,6 +7,8 @@ import tempfile
 import docx
 import io
 import csv
+import json
+import re
 from PIL import Image, ImageDraw, ImageFont
 import time
 
@@ -52,6 +54,16 @@ COLUNAS = [
     "Mês 8", "Mês 9", "Mês 10", "Mês 11", "Mês 12"
 ]
 
+# Inicializar session state
+if 'df' not in st.session_state:
+    st.session_state.df = pd.DataFrame(columns=COLUNAS)
+if 'csv_content' not in st.session_state:
+    st.session_state.csv_content = ""
+if 'imagens' not in st.session_state:
+    st.session_state.imagens = []
+if 'texto' not in st.session_state:
+    st.session_state.texto = ""
+
 # Função 1: Converter DOCX para imagens
 def docx_para_imagens(docx_bytes):
     """Converte DOCX para lista de imagens (páginas)"""
@@ -77,41 +89,45 @@ def docx_para_imagens(docx_bytes):
         texto_completo = "\n".join(textos)
         os.unlink(docx_path)
         
-        # Dividir em páginas
+        # Dividir em páginas (máximo 1500 caracteres por página)
         paginas = []
         pagina_atual = []
-        chars_por_pagina = 0
+        chars_contador = 0
         
         for linha in texto_completo.split('\n'):
-            pagina_atual.append(linha)
-            chars_por_pagina += len(linha)
-            
-            if chars_por_pagina > 800:
+            linha_comprimento = len(linha)
+            if chars_contador + linha_comprimento > 1500 and pagina_atual:
                 paginas.append("\n".join(pagina_atual))
-                pagina_atual = []
-                chars_por_pagina = 0
+                pagina_atual = [linha]
+                chars_contador = linha_comprimento
+            else:
+                pagina_atual.append(linha)
+                chars_contador += linha_comprimento
         
         if pagina_atual:
             paginas.append("\n".join(pagina_atual))
         
         # Criar imagens
         imagens = []
-        for i, texto in enumerate(paginas):
+        for texto in paginas:
+            # Criar imagem com fundo branco
             img = Image.new('RGB', (1200, 1600), color='white')
             draw = ImageDraw.Draw(img)
             
+            # Tentar carregar fonte
             try:
                 font = ImageFont.truetype("arial.ttf", 14)
             except:
                 font = ImageFont.load_default()
             
+            # Adicionar texto
             y = 50
             for linha in texto.split('\n'):
                 if linha.strip() and y < 1550:
-                    # Quebrar linhas longas
-                    for j in range(0, len(linha), 100):
+                    # Quebrar linhas muito longas
+                    for i in range(0, len(linha), 100):
                         if y < 1550:
-                            parte = linha[j:j+100]
+                            parte = linha[i:i+100]
                             draw.text((50, y), parte, fill='black', font=font)
                             y += 25
             
@@ -120,104 +136,107 @@ def docx_para_imagens(docx_bytes):
         return imagens
         
     except Exception as e:
-        st.error(f"Erro na conversão: {str(e)}")
+        st.error(f"Erro na conversão DOCX: {str(e)}")
         return []
 
 # Função 2: Transcrever imagens com Gemini Vision
-def transcrever_com_visao(imagens):
+def transcrever_imagens(imagens):
     """Transcreve imagens usando modelo de visão"""
     if not imagens:
         return ""
     
     texto_completo = ""
+    progress_bar = st.progress(0)
     
     for i, imagem in enumerate(imagens):
+        progresso = (i + 1) / len(imagens)
+        progress_bar.progress(progresso)
+        
         try:
-            # Converter para bytes
+            # Converter imagem para bytes
             img_bytes = io.BytesIO()
             imagem.save(img_bytes, format='PNG')
             img_bytes = img_bytes.getvalue()
             
-            # Prompt para transcrição exata
-            prompt = """Transcreva TODO o texto desta imagem EXATAMENTE como aparece.
-            Inclua:
+            # Prompt para transcrição completa
+            prompt = """TRANSCREVA TODO o texto desta imagem. Inclua:
             - Tabelas completas
-            - Listas
-            - Números
-            - Nomes de produtos
-            - Estados
+            - Números e valores
+            - Nomes de produtos/cultivares
+            - Estados e regiões
             - Características técnicas
-            - Tudo que estiver escrito"""
+            - Benefícios mencionados
+            - Resultados de produtividade
+            - Tudo que estiver escrito na imagem"""
             
             response = modelo_visao.generate_content([
                 prompt,
                 {"mime_type": "image/png", "data": img_bytes}
             ])
             
-            texto_completo += f"\n\n=== PÁGINA {i+1} ===\n{response.text}\n"
-            time.sleep(0.3)
+            texto_completo += f"\n\n--- PÁGINA {i+1} ---\n{response.text}\n"
+            time.sleep(0.5)  # Pausa para não sobrecarregar API
             
         except Exception as e:
-            texto_completo += f"\n\n=== ERRO PÁGINA {i+1} ===\n"
+            texto_completo += f"\n\n--- ERRO PÁGINA {i+1}: {str(e)[:100]} ---\n"
     
+    progress_bar.empty()
     return texto_completo
 
 # Função 3: Extrair dados para CSV
-def extrair_dados_para_csv(texto):
+def extrair_dados_para_csv(texto_transcrito):
     """Extrai dados do texto para o formato CSV"""
     
     prompt = f"""
-    ANALISE O TEXTO ABAIXO EXTRAÍDO DE UM DOCUMENTO SOBRE CULTIVARES.
+    ANALISE O TEXTO ABAIXO QUE FOI EXTRAÍDO DE UM DOCUMENTO SOBRE CULTIVARES.
     
-    TEXTO:
-    {texto[:15000]}
+    TEXTO TRANSCRITO:
+    {texto_transcrito[:12000]}
     
     SUA TAREFA:
-    1. Encontre TODAS as cultivares mencionadas
-    2. Para CADA cultivar, extraia informações para estas colunas:
+    1. Identifique TODAS as cultivares mencionadas
+    2. Para CADA cultivar, extraia informações para estas 81 colunas:
     
-    COLUNAS DO CSV (81 colunas):
+    LISTA DE COLUNAS:
     {', '.join(COLUNAS)}
     
-    RETORNE APENAS um array JSON onde cada objeto tem 81 propriedades com os nomes das colunas acima.
-    Use "NR" para informações não encontradas.
+    RETORNE APENAS um array JSON. Cada objeto no array deve ter 81 propriedades
+    correspondentes às colunas acima. Use "NR" para informações não encontradas.
     """
     
     try:
-        response = modelo_texto.generate_content(prompt)
-        resposta = response.text.strip()
-        
-        # Limpar resposta
-        resposta_limpa = resposta.replace('```json', '').replace('```', '').strip()
-        
-        # Tentar extrair JSON
-        import json
-        import re
-        
-        # Encontrar array JSON
-        match = re.search(r'\[.*\]', resposta_limpa, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-            dados = json.loads(json_str)
-            return dados
-        
-        # Tentar encontrar objeto JSON
-        match = re.search(r'\{.*\}', resposta_limpa, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-            dados = [json.loads(json_str)]
-            return dados
-        
-        return []
-        
+        with st.spinner("Processando texto para extrair dados..."):
+            response = modelo_texto.generate_content(prompt)
+            resposta = response.text.strip()
+            
+            # Limpar resposta
+            resposta_limpa = resposta.replace('```json', '').replace('```', '').strip()
+            
+            # Tentar encontrar JSON
+            json_match = re.search(r'(\[.*\])', resposta_limpa, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+                dados = json.loads(json_str)
+                return dados
+            
+            # Tentar encontrar objeto único
+            obj_match = re.search(r'(\{.*\})', resposta_limpa, re.DOTALL)
+            if obj_match:
+                json_str = obj_match.group(1)
+                dados = [json.loads(json_str)]
+                return dados
+            
+            st.warning("Não foi possível extrair dados estruturados da resposta.")
+            return []
+            
     except Exception as e:
-        st.error(f"Erro na extração: {str(e)}")
+        st.error(f"Erro na extração de dados: {str(e)}")
         return []
 
 # Função 4: Criar DataFrame
-def criar_dataframe_gsheets(dados):
-    """Cria DataFrame pronto para Google Sheets"""
-    if not dados:
+def criar_dataframe(dados):
+    """Cria DataFrame a partir dos dados extraídos"""
+    if not dados or not isinstance(dados, list):
         return pd.DataFrame(columns=COLUNAS)
     
     linhas = []
@@ -225,25 +244,25 @@ def criar_dataframe_gsheets(dados):
         if isinstance(item, dict):
             linha = {}
             for coluna in COLUNAS:
-                valor = item.get(coluna, "NR")
-                # Garantir que seja string
-                if valor is None:
-                    valor = "NR"
-                linha[coluna] = str(valor).strip()
+                valor = item.get(coluna)
+                if valor is None or valor == "":
+                    linha[coluna] = "NR"
+                else:
+                    linha[coluna] = str(valor).strip()
             linhas.append(linha)
     
     if linhas:
-        df = pd.DataFrame(linhas, columns=COLUNAS)
-        return df
+        return pd.DataFrame(linhas, columns=COLUNAS)
     else:
         return pd.DataFrame(columns=COLUNAS)
 
 # Função 5: Gerar CSV para Google Sheets
-def gerar_csv_gsheets(df):
+def gerar_csv_para_gsheets(df):
     """Gera CSV formatado para Google Sheets"""
-    output = io.StringIO()
+    if df.empty:
+        return ""
     
-    # Usar csv.writer com quoting para lidar com vírgulas no texto
+    output = io.StringIO()
     writer = csv.writer(output, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
     
     # Escrever cabeçalho
@@ -254,10 +273,9 @@ def gerar_csv_gsheets(df):
         linha = []
         for col in COLUNAS:
             valor = str(row.get(col, "NR")).strip()
-            # Escapar vírgulas e quebras de linha
-            if ',' in valor or '\n' in valor or '"' in valor:
-                valor = valor.replace('"', '""')  # Escapar aspas
-                valor = f'"{valor}"'  # Colocar entre aspas
+            # Tratar valores especiais
+            if valor in ["", "nan", "None", "null"]:
+                valor = "NR"
             linha.append(valor)
         writer.writerow(linha)
     
@@ -270,117 +288,129 @@ def main():
     uploaded_file = st.sidebar.file_uploader(
         "Carregue um arquivo DOCX:",
         type=["docx"],
-        help="Documento com informações de cultivares"
+        help="Documento técnico sobre cultivares"
     )
     
     if uploaded_file:
         st.sidebar.info(f"**Arquivo:** {uploaded_file.name}")
         st.sidebar.info(f"**Tamanho:** {uploaded_file.size/1024:.1f} KB")
         
-        if st.sidebar.button("🚀 Processar Documento", type="primary", use_container_width=True):
-            # Limpar estado anterior
-            for key in ['imagens', 'texto', 'df']:
-                if key in st.session_state:
-                    del st.session_state[key]
-            
-            # PASSO 1: DOCX → Imagens
-            with st.spinner("🖼️ Convertendo DOCX para imagens..."):
-                imagens = docx_para_imagens(uploaded_file.getvalue())
-                if not imagens:
-                    st.error("Falha na conversão do DOCX")
-                    return
+        col1, col2 = st.sidebar.columns(2)
+        
+        with col1:
+            if st.button("🚀 Processar Documento", type="primary", use_container_width=True):
+                # Limpar estado anterior
+                st.session_state.imagens = []
+                st.session_state.texto = ""
+                st.session_state.df = pd.DataFrame(columns=COLUNAS)
+                st.session_state.csv_content = ""
                 
-                st.session_state.imagens = imagens
-                st.success(f"✅ {len(imagens)} página(s) convertida(s)")
-            
-            # PASSO 2: Imagens → Texto
-            with st.spinner("👁️ Transcrevendo imagens com IA..."):
-                texto = transcrever_com_visao(imagens)
-                if not texto:
-                    st.error("Falha na transcrição")
-                    return
+                # PASSO 1: Converter DOCX para imagens
+                with st.spinner("🖼️ Convertendo DOCX para imagens..."):
+                    imagens = docx_para_imagens(uploaded_file.getvalue())
+                    if imagens:
+                        st.session_state.imagens = imagens
+                        st.success(f"✅ {len(imagens)} página(s) criada(s)")
+                    else:
+                        st.error("Falha na conversão do DOCX")
+                        return
                 
-                st.session_state.texto = texto
-                st.success(f"✅ Transcrição concluída")
+                # PASSO 2: Transcrever imagens
+                with st.spinner("👁️ Transcrevendo imagens com IA..."):
+                    texto = transcrever_imagens(imagens)
+                    if texto:
+                        st.session_state.texto = texto
+                        st.success(f"✅ Transcrição concluída")
+                        
+                        # Mostrar preview
+                        with st.expander("📝 Ver texto transcrito", expanded=False):
+                            st.text_area("Conteúdo:", texto[:2000] + ("..." if len(texto) > 2000 else ""), 
+                                       height=200, key="texto_preview")
+                    else:
+                        st.error("Falha na transcrição")
+                        return
                 
-                # Mostrar preview
-                with st.expander("📝 Ver texto transcrito"):
-                    st.text_area("Texto extraído:", texto[:3000] + ("..." if len(texto) > 3000 else ""), 
-                               height=250)
-            
-            # PASSO 3: Texto → Dados estruturados
-            with st.spinner("📊 Extraindo dados para CSV..."):
-                dados = extrair_dados_para_csv(texto)
-                if not dados:
-                    st.warning("⚠️ Nenhuma cultivar identificada")
-                    st.session_state.df = pd.DataFrame(columns=COLUNAS)
-                else:
-                    st.success(f"✅ {len(dados)} cultivar(s) encontrada(s)")
-                    
-                    # Criar DataFrame
-                    df = criar_dataframe_gsheets(dados)
-                    st.session_state.df = df
-                    
-                    # Gerar CSV
-                    st.session_state.csv_content = gerar_csv_gsheets(df)
+                # PASSO 3: Extrair dados
+                with st.spinner("📊 Extraindo dados para CSV..."):
+                    dados = extrair_dados_para_csv(texto)
+                    if dados:
+                        df = criar_dataframe(dados)
+                        st.session_state.df = df
+                        st.success(f"✅ {len(df)} cultivar(s) extraída(s)")
+                        
+                        # Gerar CSV
+                        csv_content = gerar_csv_para_gsheets(df)
+                        st.session_state.csv_content = csv_content
+                    else:
+                        st.warning("⚠️ Nenhuma cultivar identificada")
+                        st.session_state.df = pd.DataFrame(columns=COLUNAS)
+        
+        with col2:
+            if st.button("🔄 Limpar", use_container_width=True):
+                st.session_state.imagens = []
+                st.session_state.texto = ""
+                st.session_state.df = pd.DataFrame(columns=COLUNAS)
+                st.session_state.csv_content = ""
+                st.rerun()
         
         # Mostrar resultados
-        if 'df' in st.session_state:
-            df = st.session_state.df
+        df = st.session_state.df
+        
+        # Verificar se temos dados para mostrar
+        if df is not None and not df.empty:
+            st.header("📊 Resultados - Pronto para Google Sheets")
             
-            if not df.empty:
-                st.header("📊 Dados para Google Sheets")
-                
-                # Estatísticas
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Cultivares", len(df))
-                with col2:
-                    if 'Cultura' in df.columns:
-                        culturas = df['Cultura'].unique()
-                        st.metric("Culturas", len(culturas))
-                with col3:
-                    st.metric("Colunas", len(df.columns))
-                
-                # Visualização
-                st.subheader("👁️ Visualização dos Dados")
-                
-                # Mostrar colunas principais
-                colunas_visao = [
-                    'Cultura', 'Nome do produto', 'Tecnologia', 
-                    'Grupo de maturação', 'Fertilidade', 'Estado (por extenso)'
-                ]
-                
-                colunas_disponiveis = [c for c in colunas_visao if c in df.columns]
-                
-                if colunas_disponiveis:
-                    st.dataframe(df[colunas_disponiveis], use_container_width=True, height=300)
-                else:
-                    st.dataframe(df.iloc[:, :10], use_container_width=True, height=300)
-                
-                # Download
-                st.subheader("📥 Download para Google Sheets")
-                
-                nome_base = uploaded_file.name.split('.')[0]
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # CSV para Google Sheets
-                    csv_content = st.session_state.get('csv_content', '')
-                    if csv_content:
-                        st.download_button(
-                            label="📄 Baixar CSV (Google Sheets)",
-                            data=csv_content,
-                            file_name=f"cultivares_{nome_base}_{timestamp}.csv",
-                            mime="text/csv",
-                            help="CSV formatado para importar no Google Sheets",
-                            use_container_width=True
-                        )
-                
-                with col2:
-                    # Excel
+            # Estatísticas
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Cultivares", len(df))
+            with col2:
+                if 'Cultura' in df.columns:
+                    culturas = [c for c in df['Cultura'].unique() if c != "NR"]
+                    st.metric("Tipos", len(culturas))
+            with col3:
+                st.metric("Colunas", len(df.columns))
+            
+            # Visualização dos dados
+            st.subheader("👁️ Visualização dos Dados")
+            
+            # Selecionar colunas para mostrar
+            colunas_principais = [
+                'Cultura', 'Nome do produto', 'Tecnologia', 
+                'Grupo de maturação', 'Fertilidade', 'Estado (por extenso)'
+            ]
+            
+            colunas_disponiveis = [c for c in colunas_principais if c in df.columns]
+            
+            if colunas_disponiveis:
+                st.dataframe(df[colunas_disponiveis], use_container_width=True, height=300)
+            else:
+                # Mostrar primeiras 10 colunas
+                st.dataframe(df.iloc[:, :10], use_container_width=True, height=300)
+            
+            # Download
+            st.subheader("📥 Download")
+            
+            nome_base = uploaded_file.name.split('.')[0]
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            col_dl1, col_dl2 = st.columns(2)
+            
+            with col_dl1:
+                # CSV para Google Sheets
+                if st.session_state.csv_content:
+                    st.download_button(
+                        label="📄 Baixar CSV (Google Sheets)",
+                        data=st.session_state.csv_content,
+                        file_name=f"cultivares_{nome_base}_{timestamp}.csv",
+                        mime="text/csv",
+                        help="CSV pronto para importar no Google Sheets",
+                        use_container_width=True
+                    )
+            
+            with col_dl2:
+                # Excel
+                if not df.empty:
                     excel_buffer = io.BytesIO()
                     with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                         df.to_excel(writer, index=False, sheet_name='Cultivares')
@@ -391,68 +421,81 @@ def main():
                         data=excel_data,
                         file_name=f"cultivares_{nome_base}_{timestamp}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        help="Arquivo Excel para edição offline",
+                        help="Arquivo Excel para edição",
                         use_container_width=True
                     )
+            
+            # Instruções para Google Sheets
+            with st.expander("📋 Como usar no Google Sheets", expanded=False):
+                st.markdown("""
+                1. **Vá para [Google Sheets](https://sheets.google.com)**
+                2. **Crie uma planilha em branco**
+                3. **Arquivo → Importar → Fazer upload**
+                4. **Selecione o arquivo CSV baixado**
+                5. **Configurações de importação:**
+                   - Separador: **Vírgula**
+                   - Codificação: **UTF-8**
+                   - Detectar automaticamente: **Sim**
+                6. **Clique em Importar dados**
                 
-                # Instruções para Google Sheets
-                with st.expander("📋 Como importar no Google Sheets"):
-                    st.markdown("""
-                    1. **Vá para [Google Sheets](https://sheets.google.com)**
-                    2. **Crie uma nova planilha**
-                    3. **Arquivo → Importar → Fazer upload**
-                    4. **Selecione o arquivo CSV baixado**
-                    5. **Configurações de importação:**
-                       - Separador: **Vírgula**
-                       - Detectar automaticamente: **Sim**
-                       - Converter texto para números/datas: **Sim**
-                    6. **Clique em Importar**
-                    
-                    **Dica:** O CSV já está formatado com 81 colunas na ordem correta!
-                    """)
-                
-                # Preview do CSV
-                with st.expander("🔍 Preview do CSV gerado"):
-                    if 'csv_content' in st.session_state:
-                        linhas = st.session_state.csv_content.split('\n')[:5]
-                        st.code("\n".join(linhas), language="csv")
-                    
-            else:
-                st.warning("Nenhum dado extraído do documento.")
+                **Pronto!** Seus dados serão organizados em 81 colunas.
+                """)
+            
+            # Preview do CSV
+            with st.expander("🔍 Preview do CSV gerado", expanded=False):
+                if st.session_state.csv_content:
+                    linhas = st.session_state.csv_content.split('\n')[:3]
+                    st.code("\n".join(linhas), language="csv")
+        
+        elif df is not None and df.empty:
+            st.info("📭 Nenhum dado extraído do documento.")
+        
+        # Mostrar status do processamento
+        with st.expander("⚙️ Status do Processamento", expanded=False):
+            if st.session_state.imagens:
+                st.write(f"✅ **Imagens:** {len(st.session_state.imagens)} página(s)")
+            if st.session_state.texto:
+                st.write(f"✅ **Transcrição:** {len(st.session_state.texto):,} caracteres")
+            if st.session_state.df is not None:
+                st.write(f"✅ **DataFrame:** {len(st.session_state.df)} linha(s)")
     
     else:
         # Tela inicial
         st.markdown("""
-        ## 🌱 Pipeline de Extração para Google Sheets
+        ## 🌱 Pipeline Completo: DOCX → Google Sheets
         
-        ### 🔄 **Fluxo Completo:**
-        1. **📤 DOCX** → Carregue seu documento
-        2. **🖼️ Imagens** → Cada página vira imagem PNG
-        3. **👁️ Transcrição** → IA lê texto das imagens
-        4. **📊 Extração** → IA identifica cultivares e dados
-        5. **📄 CSV** → Gera arquivo pronto para Google Sheets
+        ### 🔄 **Fluxo de Processamento:**
         
-        ### ✅ **Formato de Saída:**
-        - **CSV com vírgulas** (padrão Google Sheets)
-        - **81 colunas** organizadas
-        - **Cabeçalhos claros**
-        - **Dados estruturados**
-        - **"NR" para campos vazios**
+        1. **📤 DOCX**  
+           → Carrega documento técnico
         
-        ### 🎯 **Pronto para Google Sheets:**
-        - Importe direto no Sheets
-        - 1 clique para visualizar
-        - Formatação preservada
-        - Fácil de filtrar e analisar
+        2. **🖼️ Conversão para Imagens**  
+           → Cada página vira imagem PNG  
+           → Preserva formatação e tabelas
         
-        **Comece carregando um DOCX na barra lateral!**
+        3. **👁️ Transcrição com IA Vision**  
+           → Usa Gemini 2.0 Flash Exp  
+           → Lê TODO o texto das imagens  
+           → Captura tabelas, números, dados técnicos
+        
+        4. **📊 Extração de Dados**  
+           → Usa Gemini 1.5 Flash  
+           → Identifica cultivares  
+           → Extrai dados para 81 colunas
+        
+        5. **📄 CSV para Google Sheets**  
+           → Gera arquivo pronto para importar  
+           → 81 colunas formatadas  
+           → Compatível com qualquer planilha
+        
+        ### ✅ **Resultado Final:**
+        - **CSV pronto para Google Sheets**
+        - **81 colunas organizadas**
+        - **Dados estruturados automaticamente**
+        - **Importação com 1 clique**
+        
+        **Para começar, carregue um DOCX na barra lateral!**
         """)
 
 if __name__ == "__main__":
-    # Inicializar session state
-    if 'df' not in st.session_state:
-        st.session_state.df = None
-    if 'csv_content' not in st.session_state:
-        st.session_state.csv_content = ""
-    
     main()
