@@ -221,7 +221,7 @@ def converter_texto_para_csv(texto_transcrito, pagina_num):
     14. URL DA IMAGEM DO MAPA: "NR"
     15. ÍCONES 1-5: Extraia os principais benefícios do texto
     16. EXIGÊNCIA À FERTILIDADE: Mesmo que "Fertilidade"
-    17. GRUPO DE MATURIDADE: Mesmo que "Grupo de maturação"
+    17. GRUPO DE MATURIDATE: Mesmo que "Grupo de maturação"
     18. PMS MÉDIO: Extraia o peso de mil sementes (ex: 150G, 165g) - se for soja, senão "NR"
     19. TIPO DE CRESCIMENTO: Indeterminado, Semideterminado, Determinado - se for soja, senão "NR"
     20. CORES: Flor, pubescência, hilo - se for soja, senão "NR"
@@ -286,22 +286,13 @@ def processar_imagem_pagina(imagem, pagina_num, total_paginas):
                 time.sleep(1)
                 linhas_csv = converter_texto_para_csv(texto_transcrito, pagina_num)
             
-            if linhas_csv:
-                return {
-                    'pagina_num': pagina_num,
-                    'imagem': imagem,
-                    'texto_transcrito': texto_transcrito,
-                    'linhas_csv': linhas_csv,
-                    'status': f'✅ {len(linhas_csv)} cultivar(s)'
-                }
-            else:
-                return {
-                    'pagina_num': pagina_num,
-                    'imagem': imagem,
-                    'texto_transcrito': texto_transcrito,
-                    'linhas_csv': [],
-                    'status': '⚠️ Nenhuma cultivar encontrada'
-                }
+            return {
+                'pagina_num': pagina_num,
+                'imagem': imagem,
+                'texto_transcrito': texto_transcrito,
+                'linhas_csv': linhas_csv,
+                'status': f'✅ {len(linhas_csv)} cultivar(s)' if linhas_csv else '⚠️ Nenhuma cultivar encontrada'
+            }
             
         except Exception as e:
             return {
@@ -359,14 +350,14 @@ with col1:
                     )
                     resultados.append(resultado)
                     
-                    # Adicionar linhas CSV se válidas
-                    if resultado['linhas_csv']:
+                    # Verificar se a chave 'linhas_csv' existe
+                    if 'linhas_csv' in resultado and resultado['linhas_csv']:
                         st.session_state.todas_linhas_csv.extend(resultado['linhas_csv'])
                         total_cultivares += len(resultado['linhas_csv'])
                 
                 st.session_state.resultados = resultados
                 
-                st.write(f"Processado: {total_cultivares} cultivar(s) encontrada(s)")
+                st.success(f"Processado! {total_cultivares} cultivar(s) encontrada(s)")
             else:
                 st.error("Falha na conversão do DOCX para imagens")
 
@@ -379,7 +370,10 @@ with col2:
         st.write("Resultados do processamento por página:")
         
         for resultado in st.session_state.resultados:
-            with st.expander(f"Página {resultado['pagina_num']} - {resultado['status']}", expanded=False):
+            # Verificar se a chave existe antes de acessar
+            status = resultado.get('status', 'Status não disponível')
+            
+            with st.expander(f"Página {resultado.get('pagina_num', 'N/A')} - {status}", expanded=False):
                 col_img, col_text = st.columns([1, 2])
                 
                 with col_img:
@@ -387,13 +381,14 @@ with col2:
                         st.image(resultado['imagem'], use_container_width=True)
                 
                 with col_text:
-                    if resultado['texto_transcrito']:
+                    if resultado.get('texto_transcrito'):
                         st.text_area("Transcrição:", 
                                    resultado['texto_transcrito'][:1000] + ("..." if len(resultado['texto_transcrito']) > 1000 else ""), 
                                    height=200, 
-                                   key=f"transc_{resultado['pagina_num']}")
+                                   key=f"transc_{resultado.get('pagina_num', '')}")
                     
-                    if resultado['linhas_csv']:
+                    # Verificar se a chave 'linhas_csv' existe
+                    if 'linhas_csv' in resultado and resultado['linhas_csv']:
                         st.write(f"Encontradas {len(resultado['linhas_csv'])} cultivar(s):")
                         for i, linha in enumerate(resultado['linhas_csv']):
                             with st.expander(f"Cultivar {i+1}", expanded=False):
@@ -402,6 +397,8 @@ with col2:
                                     st.write(f"Nome: {partes[1]}")
                                     st.write(f"Cultura: {partes[0]}")
                                     st.code(linha)
+                    else:
+                        st.info("Nenhuma cultivar encontrada nesta página")
         
         # Gerar CSV completo
         if st.session_state.todas_linhas_csv:
@@ -427,36 +424,41 @@ with col2:
             
             # Criar DataFrame
             if todas_linhas:
-                df = pd.DataFrame(todas_linhas, columns=cabecalho_partes)
-                
-                st.write(f"CSV Gerado: {len(todas_linhas)} cultivar(s)")
-                st.dataframe(df[['Cultura', 'Nome do produto', 'Fertilidade', 'Grupo de maturação', 'Lançamento', 'Estado (por extenso)']], 
-                           use_container_width=True, height=400)
-                
-                # Botões de download
-                col_dl1, col_dl2 = st.columns(2)
-                
-                with col_dl1:
-                    st.download_button(
-                        label="Baixar CSV",
-                        data=conteudo_csv,
-                        file_name=f"cultivares_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                
-                with col_dl2:
-                    excel_buffer = io.BytesIO()
-                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                        df.to_excel(writer, index=False, sheet_name='Cultivares')
-                    excel_data = excel_buffer.getvalue()
+                try:
+                    df = pd.DataFrame(todas_linhas, columns=cabecalho_partes[:len(todas_linhas[0])])
                     
-                    st.download_button(
-                        label="Baixar Excel",
-                        data=excel_data,
-                        file_name=f"cultivares_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
+                    st.write(f"CSV Gerado: {len(todas_linhas)} cultivar(s)")
+                    st.dataframe(df[['Cultura', 'Nome do produto', 'Fertilidade', 'Grupo de maturação', 'Lançamento', 'Estado (por extenso)']], 
+                               use_container_width=True, height=400)
+                    
+                    # Botões de download
+                    col_dl1, col_dl2 = st.columns(2)
+                    
+                    with col_dl1:
+                        st.download_button(
+                            label="Baixar CSV",
+                            data=conteudo_csv,
+                            file_name=f"cultivares_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                    
+                    with col_dl2:
+                        excel_buffer = io.BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            df.to_excel(writer, index=False, sheet_name='Cultivares')
+                        excel_data = excel_buffer.getvalue()
+                        
+                        st.download_button(
+                            label="Baixar Excel",
+                            data=excel_data,
+                            file_name=f"cultivares_{uploaded_file.name.split('.')[0]}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                except Exception as e:
+                    st.error(f"Erro ao criar DataFrame: {str(e)}")
+                    st.write("Conteúdo CSV gerado:")
+                    st.code(conteudo_csv[:5000])
             else:
                 st.warning("Nenhuma linha CSV válida foi gerada.")
