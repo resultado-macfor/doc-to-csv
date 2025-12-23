@@ -125,15 +125,6 @@ def processar_documento(texto):
     - Procure por seções técnicas, tabelas, características
     
     RETORNE APENAS o array JSON, sem explicações adicionais.
-    Exemplo de formato:
-    [
-      {{
-        "Cultura": "Soja",
-        "Nome do produto": "NS7524IPRO",
-        "NOME TÉCNICO/ REG": "NS7524IPRO",
-        ...
-      }}
-    ]
     """
     
     try:
@@ -141,33 +132,43 @@ def processar_documento(texto):
             response = modelo.generate_content(prompt)
             resposta = response.text.strip()
             
-            # Tentar extrair JSON da resposta
-            if '```json' in resposta:
-                json_str = resposta.split('```json')[1].split('```')[0]
-            elif '```' in resposta:
-                json_str = resposta.split('```')[1].split('```')[0]
-            else:
-                json_str = resposta
+            # Limpar e extrair JSON
+            resposta_limpa = resposta.replace('```json', '').replace('```', '').strip()
             
-            # Limpar a string JSON
-            json_str = json_str.strip()
-            if json_str.startswith('['):
-                dados = json.loads(json_str)
-            else:
-                # Tentar encontrar JSON manualmente
-                start = json_str.find('[')
-                end = json_str.rfind(']') + 1
-                if start != -1 and end > start:
-                    dados = json.loads(json_str[start:end])
+            # Tentar encontrar e extrair JSON
+            try:
+                # Primeira tentativa: parse direto
+                dados = json.loads(resposta_limpa)
+            except json.JSONDecodeError:
+                # Segunda tentativa: encontrar array JSON
+                inicio = resposta_limpa.find('[')
+                fim = resposta_limpa.rfind(']') + 1
+                
+                if inicio != -1 and fim > inicio:
+                    json_str = resposta_limpa[inicio:fim]
+                    dados = json.loads(json_str)
                 else:
-                    st.error("Não foi possível extrair JSON da resposta")
-                    return []
+                    # Tentar encontrar qualquer estrutura JSON
+                    # Remover texto antes do primeiro {
+                    if '{' in resposta_limpa:
+                        inicio = resposta_limpa.find('{')
+                        fim = resposta_limpa.rfind('}') + 1
+                        if fim > inicio:
+                            json_str = resposta_limpa[inicio:fim]
+                            # Verificar se é um array
+                            if not json_str.startswith('['):
+                                json_str = f'[{json_str}]'
+                            dados = json.loads(json_str)
+                    else:
+                        st.error("Não foi possível extrair dados JSON da resposta")
+                        st.text(f"Resposta recebida:\n{resposta[:1000]}")
+                        return []
             
             return dados
             
     except Exception as e:
         st.error(f"Erro no processamento: {str(e)}")
-        st.code(f"Resposta do modelo:\n{resposta[:1000]}")
+        st.text(f"Resposta recebida (primeiros 1000 chars):\n{resposta[:1000]}")
         return []
 
 def criar_dataframe(dados):
@@ -180,7 +181,10 @@ def criar_dataframe(dados):
         linha = {}
         for coluna in COLUNAS:
             # Usar valor do item ou "NR" se não existir
-            linha[coluna] = item.get(coluna, "NR")
+            if isinstance(item, dict):
+                linha[coluna] = item.get(coluna, "NR")
+            else:
+                linha[coluna] = "NR"
         linhas.append(linha)
     
     return pd.DataFrame(linhas)
@@ -188,10 +192,10 @@ def criar_dataframe(dados):
 def gerar_csv_tab(df):
     """Gera string CSV com separador TAB"""
     output = io.StringIO()
-    writer = csv.writer(output, delimiter='\t', quoting=csv.QUOTE_MINIMAL)
     
     # Escrever cabeçalho
-    writer.writerow(COLUNAS)
+    output.write("\t".join(COLUNAS))
+    output.write("\n")
     
     # Escrever dados
     for _, row in df.iterrows():
@@ -199,7 +203,8 @@ def gerar_csv_tab(df):
         for col in COLUNAS:
             valor = str(row[col]) if col in row else "NR"
             linha.append(valor)
-        writer.writerow(linha)
+        output.write("\t".join(linha))
+        output.write("\n")
     
     return output.getvalue()
 
@@ -215,7 +220,20 @@ def main():
     if uploaded_file:
         st.sidebar.info(f"📄 {uploaded_file.name} ({uploaded_file.size/1024:.1f} KB)")
         
-        if st.sidebar.button("🚀 Processar Documento", type="primary", use_container_width=True):
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            processar = st.button("🚀 Processar Documento", type="primary", use_container_width=True)
+        with col2:
+            if st.button("🔄 Limpar", use_container_width=True):
+                if 'df_cultivares' in st.session_state:
+                    del st.session_state.df_cultivares
+                if 'texto_original' in st.session_state:
+                    del st.session_state.texto_original
+                if 'nome_arquivo' in st.session_state:
+                    del st.session_state.nome_arquivo
+                st.rerun()
+        
+        if processar:
             with st.spinner("Extraindo texto do documento..."):
                 # Extrair texto
                 texto = extrair_texto_docx(uploaded_file.getvalue())
@@ -223,6 +241,8 @@ def main():
                 if not texto:
                     st.error("Não foi possível extrair texto do documento")
                     return
+                
+                st.info(f"✅ Texto extraído ({len(texto):,} caracteres)")
                 
                 # Mostrar preview
                 with st.expander("📝 Visualizar texto extraído", expanded=False):
@@ -233,23 +253,28 @@ def main():
                 dados = processar_documento(texto)
                 
                 if not dados:
-                    st.warning("Nenhuma cultivar encontrada no documento")
-                    return
-                
-                st.success(f"✅ {len(dados)} cultivar(s) identificada(s)")
-                
-                # Criar DataFrame
-                df = criar_dataframe(dados)
-                
-                # Salvar em session state
-                st.session_state.df_cultivares = df
-                st.session_state.texto_original = texto
-                st.session_state.nome_arquivo = uploaded_file.name
+                    st.warning("⚠️ Nenhuma cultivar encontrada no documento")
+                    # Criar DataFrame vazio
+                    st.session_state.df_cultivares = pd.DataFrame(columns=COLUNAS)
+                else:
+                    st.success(f"✅ {len(dados)} cultivar(s) identificada(s)")
+                    
+                    # Criar DataFrame
+                    df = criar_dataframe(dados)
+                    
+                    # Salvar em session state
+                    st.session_state.df_cultivares = df
+                    st.session_state.texto_original = texto
+                    st.session_state.nome_arquivo = uploaded_file.name
         
         # Mostrar resultados se disponíveis
         if 'df_cultivares' in st.session_state:
             df = st.session_state.df_cultivares
             
+            if df.empty:
+                st.warning("Nenhum dado disponível para exibição.")
+                return
+                
             st.header("📊 Resultados da Extração")
             
             # Estatísticas
@@ -260,10 +285,13 @@ def main():
                 if 'Cultura' in df.columns:
                     culturas = df['Cultura'].unique()
                     st.metric("Tipos de Cultura", len(culturas))
+                else:
+                    st.metric("Colunas", len(df.columns))
             with col3:
                 if 'Tecnologia' in df.columns:
                     techs = df['Tecnologia'].unique()
-                    st.metric("Tecnologias", len([t for t in techs if t != "NR"]))
+                    techs_validos = [t for t in techs if t != "NR" and str(t) != "nan"]
+                    st.metric("Tecnologias", len(techs_validos))
             
             # Visualização principal
             st.subheader("📋 Dados Extraídos")
@@ -279,7 +307,7 @@ def main():
             if colunas_disponiveis:
                 st.dataframe(df[colunas_disponiveis], use_container_width=True, height=300)
             else:
-                st.dataframe(df, use_container_width=True, height=300)
+                st.dataframe(df.iloc[:, :10], use_container_width=True, height=300)
             
             # Visualização completa
             with st.expander("🔍 Visualizar TODAS as 81 colunas", expanded=False):
@@ -321,25 +349,35 @@ def main():
             
             with col3:
                 # Texto original
-                texto = st.session_state.get('texto_original', '')
-                if texto:
-                    st.download_button(
-                        label="📝 Baixar Texto",
-                        data=texto,
-                        file_name=f"{nome_base}_texto_{timestamp}.txt",
-                        mime="text/plain",
-                        use_container_width=True
-                    )
+                if 'texto_original' in st.session_state:
+                    texto = st.session_state.texto_original
+                    if texto:
+                        st.download_button(
+                            label="📝 Baixar Texto",
+                            data=texto,
+                            file_name=f"{nome_base}_texto_{timestamp}.txt",
+                            mime="text/plain",
+                            use_container_width=True
+                        )
             
             # Informações técnicas
             with st.expander("⚙️ Informações Técnicas", expanded=False):
                 st.write(f"**Total de colunas:** {len(df.columns)}")
-                st.write(f"**Colunas preenchidas:** {len([c for c in df.columns if not df[c].eq('NR').all()])}")
-                st.write(f"**Exemplo de linha extraída:**")
+                
+                # Contar colunas preenchidas
+                colunas_preenchidas = 0
+                for coluna in df.columns:
+                    if not df[coluna].isna().all() and not (df[coluna] == "NR").all():
+                        colunas_preenchidas += 1
+                
+                st.write(f"**Colunas com dados:** {colunas_preenchidas}")
                 
                 if not df.empty:
-                    exemplo = df.iloc[0]
-                    st.json(exemplo.to_dict())
+                    st.write(f"**Primeira cultivar extraída:**")
+                    primeira = df.iloc[0].to_dict()
+                    # Mostrar apenas valores não "NR"
+                    primeira_filtrada = {k: v for k, v in primeira.items() if v != "NR" and str(v) != "nan"}
+                    st.json(primeira_filtrada)
     
     else:
         # Tela inicial
