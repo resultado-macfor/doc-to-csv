@@ -32,8 +32,8 @@ if not gemini_api_key:
 
 try:
     genai.configure(api_key=gemini_api_key)
-    modelo_vision = genai.GenerativeModel("gemini-1.5-flash")  # Melhor para visão
-    modelo_texto = genai.GenerativeModel("gemini-1.5-flash")
+    modelo_vision = genai.GenerativeModel("gemini-2.5-flash")  # Melhor para visão
+    modelo_texto = genai.GenerativeModel("gemini-2.5-flash")
 except Exception as e:
     st.error(f"Erro ao configurar o Gemini: {str(e)}")
     st.stop()
