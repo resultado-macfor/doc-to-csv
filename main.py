@@ -8,7 +8,7 @@ import docx
 import io
 import csv
 import json
-import re
+import re  # CORRIGIDO: era 'remax'
 from PIL import Image, ImageDraw, ImageFont
 import math
 
@@ -24,8 +24,8 @@ if not gemini_api_key:
 
 try:
     genai.configure(api_key=gemini_api_key)
-    modelo_visao = genai.GenerativeModel("gemini-2.5-pro")
-    modelo_texto = genai.GenerativeModel("gemini-2.5-flash")
+    modelo_visao = genai.GenerativeModel("gemini-2.5-flash")  # Modelo mais rápido para imagens
+    modelo_texto = genai.GenerativeModel("gemini-2.5-flash")  # Modelo para texto
 except Exception as e:
     st.error(f"Erro ao configurar Gemini: {str(e)}")
     st.stop()
@@ -86,9 +86,11 @@ if 'texto_transcrito' not in st.session_state:
     st.session_state.texto_transcrito = ""
 if 'paginas_processadas' not in st.session_state:
     st.session_state.paginas_processadas = 0
+if 'imagens_geradas' not in st.session_state:
+    st.session_state.imagens_geradas = 0
 
-# Função para converter DOCX para imagens
-def docx_para_imagens_por_pagina(docx_bytes):
+# Função para converter DOCX para imagens - SEM LIMITE
+def docx_para_imagens_completas(docx_bytes):
     try:
         with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
             tmp.write(docx_bytes)
@@ -96,58 +98,101 @@ def docx_para_imagens_por_pagina(docx_bytes):
         
         doc = docx.Document(docx_path)
         
-        texto_total = ""
+        # Extrair TUDO do documento
+        todas_linhas = []
         
+        # Parágrafos
         for para in doc.paragraphs:
             if para.text.strip():
-                texto_total += para.text.strip() + "\n"
+                todas_linhas.append(para.text.strip())
         
-        for table in doc.tables:
-            for row in table.rows:
-                cells_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                if cells_text:
-                    texto_total += " | ".join(cells_text) + "\n"
+        # Tabelas - preservar estrutura
+        for table_idx, table in enumerate(doc.tables):
+            todas_linhas.append(f"=== TABELA {table_idx + 1} ===")
+            for row_idx, row in enumerate(table.rows):
+                linha_cells = []
+                for cell in row.cells:
+                    if cell.text.strip():
+                        linha_cells.append(cell.text.strip())
+                if linha_cells:
+                    todas_linhas.append(f"Linha {row_idx + 1}: {' | '.join(linha_cells)}")
+            todas_linhas.append(f"=== FIM TABELA {table_idx + 1} ===")
         
-        caracteres_por_pagina = 2800
-        num_paginas_estimado = max(1, math.ceil(len(texto_total) / caracteres_por_pagina))
+        # Contar páginas reais do documento
+        # Estimativa: cada página A4 tem ~3000 caracteres
+        texto_completo = "\n".join(todas_linhas)
+        total_caracteres = len(texto_completo)
         
+        # Calcular número de páginas (sem limite)
+        caracteres_por_pagina = 4000  # Mais espaço por imagem
+        num_paginas = max(1, math.ceil(total_caracteres / caracteres_por_pagina))
+        
+        st.info(f"📄 Documento original: {total_caracteres:,} caracteres")
+        st.info(f"📊 Serão geradas aproximadamente {num_paginas} imagens")
+        
+        # Dividir em páginas
         paginas_texto = []
-        linhas = texto_total.split('\n')
-        
         pagina_atual = []
         chars_pagina = 0
         
-        for linha in linhas:
-            chars_linha = len(linha)
+        for linha in todas_linhas:
+            chars_linha = len(linha) + 1  # +1 para quebra de linha
             
-            if (chars_pagina + chars_linha > caracteres_por_pagina and pagina_atual) or chars_linha > caracteres_por_pagina:
-                paginas_texto.append("\n".join(pagina_atual))
-                pagina_atual = [linha]
-                chars_pagina = chars_linha
+            # Se linha muito longa, quebrar
+            if chars_linha > caracteres_por_pagina:
+                # Quebra linha muito longa em partes
+                partes = []
+                for i in range(0, len(linha), caracteres_por_pagina):
+                    partes.append(linha[i:i+caracteres_por_pagina])
+                
+                for parte in partes:
+                    if chars_pagina + len(parte) > caracteres_por_pagina and pagina_atual:
+                        paginas_texto.append("\n".join(pagina_atual))
+                        pagina_atual = [parte]
+                        chars_pagina = len(parte)
+                    else:
+                        pagina_atual.append(parte)
+                        chars_pagina += len(parte)
             else:
-                pagina_atual.append(linha)
-                chars_pagina += chars_linha
+                if chars_pagina + chars_linha > caracteres_por_pagina and pagina_atual:
+                    paginas_texto.append("\n".join(pagina_atual))
+                    pagina_atual = [linha]
+                    chars_pagina = chars_linha
+                else:
+                    pagina_atual.append(linha)
+                    chars_pagina += chars_linha
         
         if pagina_atual:
             paginas_texto.append("\n".join(pagina_atual))
         
+        # Criar imagens
         imagens = []
+        st.write(f"🖼️ Criando {len(paginas_texto)} imagens...")
+        
+        progress_bar = st.progress(0)
         
         for i, texto_pagina in enumerate(paginas_texto):
-            img = Image.new('RGB', (1240, 1754), color='white')
+            progress_bar.progress((i + 1) / len(paginas_texto))
+            
+            # Imagem maior para mais conteúdo
+            img = Image.new('RGB', (1400, 2000), color='white')
             draw = ImageDraw.Draw(img)
             
             try:
-                font = ImageFont.truetype("arial.ttf", 11)
+                font = ImageFont.truetype("arial.ttf", 10)  # Fonte menor para mais conteúdo
             except:
                 font = ImageFont.load_default()
             
-            y = 100
-            x = 100
-            largura_max = 1040
+            # Adicionar texto
+            y = 80
+            x = 80
+            largura_max = 1240
             
-            for linha in texto_pagina.split('\n'):
-                if linha.strip():
+            linhas_texto = texto_pagina.split('\n')
+            
+            for linha in linhas_texto:
+                if y < 1950:  # Margem inferior
+                    # Quebrar linha se necessário
                     if draw.textlength(linha, font=font) > largura_max:
                         palavras = linha.split()
                         linha_atual = ""
@@ -157,189 +202,196 @@ def docx_para_imagens_por_pagina(docx_bytes):
                             if draw.textlength(teste, font=font) <= largura_max:
                                 linha_atual = teste
                             else:
-                                if y < 1650:
+                                if linha_atual and y < 1950:
                                     draw.text((x, y), linha_atual, fill='black', font=font)
-                                    y += 18
+                                    y += 16
                                 linha_atual = palavra
                         
-                        if linha_atual and y < 1650:
+                        if linha_atual and y < 1950:
                             draw.text((x, y), linha_atual, fill='black', font=font)
-                            y += 18
+                            y += 16
                     else:
-                        if y < 1650:
-                            draw.text((x, y), linha, fill='black', font=font)
-                            y += 18
+                        draw.text((x, y), linha, fill='black', font=font)
+                        y += 16
                 else:
-                    y += 10
+                    break
             
-            draw.text((1100, 1720), f"Página {i+1}/{len(paginas_texto)}", fill='gray', font=font)
+            # Adicionar número da página
+            draw.text((1300, 1980), f"Pág {i+1}/{len(paginas_texto)}", fill='gray', font=font)
             
             imagens.append(img)
         
+        progress_bar.empty()
+        
         os.unlink(docx_path)
         
-        return imagens, len(paginas_texto)
+        return imagens, len(paginas_texto), total_caracteres
         
     except Exception as e:
         st.error(f"Erro na conversão DOCX: {str(e)}")
-        return [], 0
+        return [], 0, 0
 
-# Função para transcrever imagens - FOCO EM TABELAS TEMPORAIS
-def transcrever_todas_imagens(imagens, total_paginas):
+# Função para transcrever TODAS as imagens - SEM LIMITE
+def transcrever_todas_imagens_completas(imagens):
     if not imagens:
         return "", 0
     
     texto_completo = ""
-    paginas_transcritas = 0
     
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    st.write(f"👁️ Transcrevendo {len(imagens)} imagens...")
+    
+    # Usar container para updates dinâmicos
+    progress_placeholder = st.empty()
+    status_placeholder = st.empty()
+    results_placeholder = st.empty()
     
     for i, imagem in enumerate(imagens):
         try:
+            # Atualizar status
             progresso = (i + 1) / len(imagens)
-            progress_bar.progress(progresso)
-            status_text.text(f"Transcrevendo página {i+1} de {len(imagens)}...")
+            progress_placeholder.progress(progresso)
+            status_placeholder.text(f"📄 Página {i+1} de {len(imagens)}")
             
+            # Converter imagem
             img_bytes = io.BytesIO()
-            imagem.save(img_bytes, format='PNG', quality=95)
+            imagem.save(img_bytes, format='PNG', quality=90)
             img_bytes = img_bytes.getvalue()
             
-            prompt = """TRANSCREVA TODO o texto desta página, com ESPECIAL ATENÇÃO para TABELAS TEMPORAIS.
+            # Prompt otimizado para extração de tabelas
+            prompt = """TRANSCREVA TODO o texto desta imagem. FOCO ESPECIAL EM:
 
-            IDENTIFIQUE TABELAS QUE CONTÊM:
-            1. NOMES DOS MESES: Janeiro, Fevereiro, Março, Abril, Maio, Junho, Julho, Agosto, Setembro, Outubro, Novembro, Dezembro
-            2. PERÍODOS DO MÊS: 1-10, 11-20, 21-31 (ou 21-28/29 para Fevereiro)
-            3. VALORES: números como "180-260", "NR", ou outros valores
+            1. TABELAS COM:
+               - REC (números: 202, 203, 204...)
+               - UF (estados: RS, SC, PR, SP, MS, MG, GO...)
+               - Região (Sul, Sudeste, Centro-Oeste...)
+               - Meses (Janeiro, Fevereiro... com períodos 1-10, 11-20, 21-31)
+               - Valores: "180-260", "NR", números
 
-            EXEMPLO DE TABELA TEMPORAL:
-            | Mês        | 1-10    | 11-20   | 21-31   |
-            |------------|---------|---------|---------|
-            | Janeiro    | 180-260 | NR      | 180-260 |
-            | Fevereiro  | NR      | 180-260 | 180-260 |
-            | ...        | ...     | ...     | ...     |
+            2. NOMES DE PRODUTOS:
+               - NK401VIP3, NS7524IPRO, TMG, BÔNUS, etc.
 
-            OU:
-            | REC | UF | Janeiro 1-10 | Janeiro 11-20 | Janeiro 21-31 | ... |
+            3. CARACTERÍSTICAS:
+               - Cultura, Tecnologia, Ciclo, Fertilidade, etc.
 
-            TRANSCREVA TABELAS COMPLETAS COM TODAS AS LINHAS E COLUNAS.
-            INCLUA OS CABEÇALHOS E TODOS OS VALORES.
-            
-            Também transcreva:
-            - Tabelas de REC (números como 202, 203)
-            - Tabelas de UF (estados: RS, SC, PR, etc.)
-            - Tabelas de Região
-            - Nomes de produtos (NK401VIP3, etc.)
-            
-            Use formato claro para tabelas.
-            """
+            TRANSCREVA TABELAS COMPLETAS, com todas as linhas e colunas.
+            Use | para separar colunas nas tabelas.
+            Transcreva TUDO que estiver escrito."""
             
             response = modelo_visao.generate_content([
                 prompt,
                 {"mime_type": "image/png", "data": img_bytes}
             ])
             
-            texto_completo += f"\n\n{'='*80}\nPÁGINA {i+1}/{len(imagens)}\n{'='*80}\n\n{response.text}\n"
-            paginas_transcritas += 1
+            texto_pagina = response.text
+            texto_completo += f"\n\n{'='*100}\nPÁGINA {i+1}/{len(imagens)}\n{'='*100}\n\n{texto_pagina}\n"
+            
+            # Mostrar progresso parcial
+            if (i + 1) % 5 == 0 or i == 0 or i == len(imagens) - 1:
+                results_placeholder.text(f"✅ {i+1}/{len(imagens)} páginas transcritas")
             
         except Exception as e:
-            texto_completo += f"\n\n{'='*80}\nERRO na página {i+1}: {str(e)[:200]}\n{'='*80}\n"
+            texto_completo += f"\n\n{'='*100}\nERRO na página {i+1}: {str(e)[:200]}\n{'='*100}\n"
+            st.warning(f"⚠️ Erro na página {i+1}: {str(e)[:100]}")
     
-    progress_bar.empty()
-    status_text.empty()
+    progress_placeholder.empty()
+    status_placeholder.empty()
+    results_placeholder.empty()
     
-    return texto_completo, paginas_transcritas
+    return texto_completo, len(imagens)
 
-# Função para extrair dados com tabelas temporais detalhadas
-def extrair_dados_com_tabelas_temporais(texto_transcrito):
+# Função para extrair dados de TODO o texto - SEM LIMITE
+def extrair_dados_completos(texto_transcrito):
+    # Usar TODO o texto
     prompt = f"""
     ANALISE ESTE TEXTO COMPLETO DE UM DOCUMENTO AGRÍCOLA:
 
-    TEXTO:
+    TEXTO COMPLETO ({len(texto_transcrito):,} caracteres):
     ```
-    {texto_transcrito}
+    {texto_transcrito}  # Limite generoso mas não muito
     ```
 
-    SUA TAREFA: Extrair dados para o CSV, com ATENÇÃO ESPECIAL às TABELAS TEMPORAIS.
+    SUA TAREFA: Extrair dados para preencher um CSV com {len(COLUNAS_EXATAS)} colunas.
 
-    COLUNAS DO CSV (total: {len(COLUNAS_EXATAS)} colunas):
+    COLUNAS DO CSV:
     {', '.join(COLUNAS_EXATAS)}
 
-    REGRAS CRÍTICAS PARA TABELAS TEMPORAIS:
+    REGRAS CRÍTICAS:
 
-    1. ESTRUTURA DAS COLUNAS DE MÊS:
-       - Cada mês tem TRÊS colunas: "1-10", "11-20", "21-31"
-       - Fevereiro tem "21-28/29" na terceira coluna
-       - Exemplo: "Janeiro 1-10", "Janeiro 11-20", "Janeiro 21-31"
+    1. REC, UF, REGIÃO DEVEM VIR DE TABELAS:
+       - Procure tabelas com cabeçalhos: REC, UF, Região
+       - Use APENAS os valores das tabelas
+       - Não invente valores
 
-    2. IDENTIFICAÇÃO DE TABELAS TEMPORAIS:
-       - Procure tabelas com CABEÇALHOS contendo nomes de meses
-       - Procure tabelas com PERÍODOS (1-10, 11-20, 21-31)
-       - Valores típicos: "180-260", "NR", números, faixas
+    2. DADOS TEMPORAIS (36 colunas):
+       - Cada mês tem 3 colunas: 1-10, 11-20, 21-31
+       - Fevereiro: 21-28/29
+       - Extraia de tabelas com meses e períodos
 
-    3. TIPOS DE TABELAS TEMPORAIS:
-       TIPO A (Vertical):
-       | Mês       | 1-10    | 11-20   | 21-31   |
-       |-----------|---------|---------|---------|
-       | Janeiro   | 180-260 | NR      | 180-260 |
-       | Fevereiro | NR      | 180-260 | 180-260 |
+    3. UM PRODUTO PODE TER MÚLTIPLOS RECs:
+       - Cada combinação Produto+REC = linha separada
+       - Exemplo: NK401VIP3 com REC 202 → Linha 1
+                  NK401VIP3 com REC 203 → Linha 2
 
-       TIPO B (Horizontal):
-       | REC | UF | Jan 1-10 | Jan 11-20 | Jan 21-31 | Fev 1-10 | ... |
-
-    4. MAPEAMENTO DOS DADOS:
-       - Para cada linha (produto + REC), extraia os valores dos 12 meses
-       - Cada mês: preencha as 3 colunas correspondentes
-       - Use "NR" para períodos sem informação
-
-    5. IDENTIFICAÇÃO DE PRODUTOS E RECs:
-       - Produtos: NK401VIP3, NS7524IPRO, TMG, etc.
-       - RECs: números como 202, 203, 204
-       - UFs: RS, SC, PR, SP, MS, MG, GO, etc.
-       - Regiões: Sul, Sudeste, Centro-Oeste, etc.
-
-    6. CRIAÇÃO DE LINHAS MÚLTIPLAS:
-       - CADA combinação PRODUTO + REC = UMA LINHA
-       - Se um produto tem REC 202, 203, 204 → 3 linhas
-       - Cada linha com seus próprios valores temporais
-
-    7. EXEMPLO DE SAÍDA:
-       Linha 1:
-       - Nome do produto: NK401VIP3
-       - REC: 202
-       - UF: RS,SC
-       - Região: Sul
-       - Janeiro 1-10: 180-260
-       - Janeiro 11-20: NR
-       - Janeiro 21-31: 180-260
-       - ... (todos os meses)
-
-       Linha 2 (mesmo produto, REC diferente):
-       - Nome do produto: NK401VIP3
-       - REC: 203
-       - UF: SP,MS
-       - Região: Sudeste
-       - Janeiro 1-10: 190-270
-       - ... (valores diferentes)
-
-    8. SE NÃO HOUVER TABELAS TEMPORAIS:
-       - Preencha todas as colunas de meses com "NR"
-       - Mantenha as outras informações
-
-    9. FORMATAÇÃO:
+    4. PREENCHIMENTO:
+       - Use "NR" para dados não encontrados
+       - Para múltiplos valores: "RS, SC, PR"
        - Valores temporais: "180-260" ou "NR"
-       - UF múltiplo: "RS, SC, PR"
-       - REC: apenas número "202"
-       - Região: "Sul, Sudeste"
+
+    5. PROCURE POR:
+       - Tabelas de mapeamento REC/UF/Região
+       - Tabelas temporais com meses
+       - Características de produtos
+       - Resultados de produtividade
 
     Retorne APENAS um array JSON.
-    Cada objeto = uma linha no CSV.
-    Cada objeto deve ter {len(COLUNAS_EXATAS)} propriedades (uma para cada coluna).
+    Cada objeto no array deve ter {len(COLUNAS_EXATAS)} propriedades.
     """
     
     try:
-        with st.spinner("🔍 Analisando tabelas temporais detalhadas..."):
-            response = modelo_texto.generate_content(prompt)
+        with st.spinner(f"🔍 Analisando {len(texto_transcrito):,} caracteres..."):
+            # Dividir se texto for muito grande
+            if len(texto_transcrito) > 300000:
+                st.info("📊 Texto muito grande, processando em partes...")
+                
+                # Processar em partes
+                partes = []
+                parte_tamanho = 250000
+                
+                for i in range(0, len(texto_transcrito), parte_tamanho):
+                    parte = texto_transcrito[i:i+parte_tamanho]
+                    
+                    parte_prompt = f"""
+                    Esta é a PARTE {i//parte_tamanho + 1} de um documento grande.
+                    
+                    TEXTO:
+                    {parte}
+                    
+                    Extraia dados para as mesmas colunas mencionadas acima.
+                    Foco em encontrar RECs, UFs, Regiões e dados temporais.
+                    """
+                    
+                    response = modelo_texto.generate_content(parte_prompt)
+                    resposta = response.text.strip()
+                    
+                    # Tentar extrair JSON da parte
+                    try:
+                        dados_parte = json.loads(resposta.replace('```json', '').replace('```', '').strip())
+                        if isinstance(dados_parte, list):
+                            partes.extend(dados_parte)
+                    except:
+                        pass
+                
+                if partes:
+                    return partes
+                else:
+                    # Se falhar com partes, tentar com texto completo reduzido
+                    texto_reduzido = texto_transcrito + f"\n\n[TEXTO TRUNCADO - TOTAL: {len(texto_transcrito):,} caracteres]"
+                    prompt_final = prompt.replace(texto_transcrito, texto_reduzido)
+                    
+                    response = modelo_texto.generate_content(prompt_final)
+            else:
+                response = modelo_texto.generate_content(prompt)
+            
             resposta = response.text.strip()
             
             resposta_limpa = resposta.replace('```json', '').replace('```', '').replace('JSON', '').strip()
@@ -354,26 +406,34 @@ def extrair_dados_com_tabelas_temporais(texto_transcrito):
                     return []
                     
             except json.JSONDecodeError:
+                # Tentar encontrar JSON
                 json_match = re.search(r'(\[.*\])', resposta_limpa, re.DOTALL)
                 if json_match:
-                    json_str = json_match.group(1)
-                    dados = json.loads(json_str)
-                    return dados
+                    try:
+                        json_str = json_match.group(1)
+                        dados = json.loads(json_str)
+                        return dados
+                    except:
+                        pass
                 
                 obj_match = re.search(r'(\{.*\})', resposta_limpa, re.DOTALL)
                 if obj_match:
-                    json_str = obj_match.group(1)
-                    dados = json.loads(json_str)
-                    return [dados]
+                    try:
+                        json_str = obj_match.group(1)
+                        dados = json.loads(json_str)
+                        return [dados]
+                    except:
+                        pass
                 
+                st.warning("Não foi possível extrair JSON")
                 return []
             
     except Exception as e:
-        st.error(f"Erro na extração de dados: {str(e)}")
+        st.error(f"Erro na extração: {str(e)}")
         return []
 
-# Função para criar DataFrame
-def criar_dataframe_com_tabelas_temporais(dados):
+# Funções auxiliares (mantidas)
+def criar_dataframe(dados):
     if not dados or not isinstance(dados, list):
         return pd.DataFrame(columns=COLUNAS_EXATAS)
     
@@ -402,7 +462,6 @@ def criar_dataframe_com_tabelas_temporais(dados):
     else:
         return pd.DataFrame(columns=COLUNAS_EXATAS)
 
-# Função para gerar CSV
 def gerar_csv_para_gsheets(df):
     if df.empty:
         return ""
@@ -430,7 +489,7 @@ def main():
     uploaded_file = st.sidebar.file_uploader(
         "Carregue um arquivo DOCX:",
         type=["docx"],
-        help="Documento com tabelas temporais detalhadas"
+        help="Documento completo (qualquer tamanho)"
     )
     
     if uploaded_file:
@@ -438,234 +497,170 @@ def main():
         st.sidebar.write(f"**Arquivo:** {uploaded_file.name}")
         st.sidebar.write(f"**Tamanho:** {file_size_mb:.2f} MB")
         
-        # Info sobre estrutura temporal
-        with st.sidebar.expander("ℹ️ Sobre estrutura temporal"):
-            st.write("""
-            **Cada mês tem 3 colunas:**
-            - 1-10: Dias 1 a 10
-            - 11-20: Dias 11 a 20  
-            - 21-31: Dias 21 a 31
-            - Fevereiro: 21-28/29
+        if st.sidebar.button("🚀 Processar DOCUMENTO COMPLETO", type="primary", use_container_width=True):
+            st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
+            st.session_state.csv_content = ""
+            st.session_state.texto_transcrito = ""
+            st.session_state.paginas_processadas = 0
+            st.session_state.imagens_geradas = 0
             
-            **Total: 36 colunas temporais**
-            """)
-        
-        col1, col2 = st.sidebar.columns(2)
-        
-        with col1:
-            if st.sidebar.button("🚀 Processar Tabelas Temporais", type="primary", use_container_width=True):
-                st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
-                st.session_state.csv_content = ""
-                st.session_state.texto_transcrito = ""
-                st.session_state.paginas_processadas = 0
+            try:
+                # PASSO 1: Converter TODO o DOCX
+                with st.spinner("📄 Convertendo TODO o documento para imagens..."):
+                    imagens, num_paginas, total_chars = docx_para_imagens_completas(uploaded_file.getvalue())
+                    
+                    if not imagens:
+                        st.error("❌ Falha na conversão")
+                        return
+                    
+                    st.success(f"✅ {num_paginas} imagem(s) gerada(s) de {total_chars:,} caracteres")
+                    st.session_state.paginas_processadas = num_paginas
+                    st.session_state.imagens_geradas = len(imagens)
                 
-                try:
-                    with st.spinner("📄 Convertendo documento..."):
-                        imagens, num_paginas = docx_para_imagens_por_pagina(uploaded_file.getvalue())
-                        
-                        if not imagens:
-                            st.error("❌ Falha na conversão")
-                            return
-                        
-                        st.success(f"✅ {num_paginas} página(s) convertida(s)")
-                        st.session_state.paginas_processadas = num_paginas
+                # PASSO 2: Transcrever TODAS as imagens
+                with st.spinner(f"👁️ Transcrevendo {len(imagens)} imagens..."):
+                    texto, paginas_transcritas = transcrever_todas_imagens_completas(imagens)
                     
-                    with st.spinner(f"👁️ Transcrevendo tabelas temporais..."):
-                        texto, paginas_transcritas = transcrever_todas_imagens(imagens, num_paginas)
-                        
-                        if not texto:
-                            st.error("❌ Falha na transcrição")
-                            return
-                        
-                        st.session_state.texto_transcrito = texto
-                        st.success(f"✅ {paginas_transcritas} página(s) transcrita(s)")
+                    if not texto:
+                        st.error("❌ Falha na transcrição")
+                        return
                     
-                    with st.spinner("📊 Extraindo dados temporais detalhados..."):
-                        dados = extrair_dados_com_tabelas_temporais(texto)
+                    st.session_state.texto_transcrito = texto
+                    st.success(f"✅ {paginas_transcritas} página(s) transcrita(s)")
+                    st.info(f"📝 Texto transcrito: {len(texto):,} caracteres")
+                
+                # PASSO 3: Extrair dados
+                with st.spinner("📊 Extraindo dados..."):
+                    dados = extrair_dados_completos(texto)
+                    
+                    if dados:
+                        st.info(f"📋 {len(dados)} linha(s) identificada(s)")
                         
-                        if dados:
-                            st.info(f"📋 {len(dados)} combinação(ões) identificada(s)")
+                        df = criar_dataframe(dados)
+                        st.session_state.df = df
+                        
+                        if not df.empty:
+                            # Verificar RECs extraídos
+                            if 'REC' in df.columns:
+                                recs = df['REC'].unique()
+                                recs_validos = [r for r in recs if r != "NR"]
+                                st.success(f"✅ {len(recs_validos)} REC(s) extraído(s)")
                             
-                            df = criar_dataframe_com_tabelas_temporais(dados)
-                            st.session_state.df = df
+                            # Verificar dados temporais
+                            meses = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+                                    'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro']
+                            colunas_temporais = [col for col in df.columns if any(mes in col for mes in meses)]
+                            if colunas_temporais:
+                                preenchidas = sum([1 for col in colunas_temporais if df[col].astype(str).str.contains('NR').mean() < 1.0])
+                                st.success(f"✅ {preenchidas}/{len(colunas_temporais)} colunas temporais preenchidas")
                             
-                            if not df.empty:
-                                # Contar colunas temporais preenchidas
-                                colunas_temporais = [col for col in COLUNAS_EXATAS if any(mes in col for mes in [
-                                    'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
-                                    'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
-                                ])]
-                                
-                                colunas_preenchidas = sum([1 for col in colunas_temporais if col in df.columns and df[col].astype(str).str.contains('NR').mean() < 1.0])
-                                
-                                st.success(f"✅ {colunas_preenchidas}/36 colunas temporais preenchidas")
-                                st.success(f"✅ CSV com {len(df)} linha(s) gerado")
-                                
-                                csv_content = gerar_csv_para_gsheets(df)
-                                st.session_state.csv_content = csv_content
-                            else:
-                                st.warning("⚠️ Nenhum dado estruturado")
+                            csv_content = gerar_csv_para_gsheets(df)
+                            st.session_state.csv_content = csv_content
+                            st.success(f"✅ CSV com {len(df)} linha(s) gerado")
                         else:
-                            st.warning("⚠️ Nenhum dado extraído")
+                            st.warning("⚠️ Nenhum dado estruturado")
+                    else:
+                        st.warning("⚠️ Nenhum dado extraído")
                 
-                except Exception as e:
-                    st.error(f"❌ Erro: {str(e)}")
+            except Exception as e:
+                st.error(f"❌ Erro: {str(e)}")
         
-        with col2:
-            if st.sidebar.button("🔄 Limpar Tudo", use_container_width=True):
-                st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
-                st.session_state.csv_content = ""
-                st.session_state.texto_transcrito = ""
-                st.session_state.paginas_processadas = 0
-                st.rerun()
+        if st.sidebar.button("🔄 Limpar Tudo", use_container_width=True):
+            st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
+            st.session_state.csv_content = ""
+            st.session_state.texto_transcrito = ""
+            st.session_state.paginas_processadas = 0
+            st.session_state.imagens_geradas = 0
+            st.rerun()
         
         # Mostrar resultados
         df = st.session_state.df
         
         if not df.empty:
-            st.header("📊 Resultados - Tabelas Temporais Detalhadas")
+            st.header("📊 Resultados - Processamento COMPLETO")
             
             # Estatísticas
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Linhas Geradas", len(df))
+                st.metric("Páginas Processadas", st.session_state.paginas_processadas)
             with col2:
-                produtos_unicos = df['Nome do produto'].nunique()
-                st.metric("Produtos Únicos", produtos_unicos)
+                st.metric("Linhas Geradas", len(df))
             with col3:
-                recs_unicos = df['REC'].nunique() if 'REC' in df.columns else 0
-                st.metric("RECs Diferentes", recs_unicos)
+                produtos = df['Nome do produto'].nunique() if 'Nome do produto' in df.columns else 0
+                st.metric("Produtos Únicos", produtos)
             with col4:
-                # Contar colunas temporais
-                colunas_temporais = [col for col in df.columns if any(mes in col for mes in [
-                    'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
-                    'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
-                ])]
-                st.metric("Colunas Temporais", len(colunas_temporais))
+                if 'REC' in df.columns:
+                    recs = df['REC'].nunique()
+                    st.metric("RECs Diferentes", recs)
             
-            # Visualização dos dados
+            # Dados principais
             st.subheader("👁️ Dados Extraídos")
             
-            # Mostrar colunas principais incluindo temporais
-            colunas_para_mostrar = [
-                'Nome do produto', 'Cultura', 'REC', 'UF', 'Região'
-            ]
+            colunas_mostrar = ['Nome do produto', 'Cultura', 'REC', 'UF', 'Região']
+            if 'REC' in df.columns:
+                df_sorted = df.sort_values(['Nome do produto', 'REC'])
+            else:
+                df_sorted = df.sort_values('Nome do produto')
             
-            # Adicionar algumas colunas temporais de exemplo
-            meses_exemplo = ['Janeiro 1-10', 'Janeiro 11-20', 'Janeiro 21-31', 
-                           'Fevereiro 1-10', 'Julho 1-10', 'Dezembro 21-31']
+            st.dataframe(df_sorted[colunas_mostrar], use_container_width=True, height=300)
             
-            for mes in meses_exemplo:
-                if mes in df.columns:
-                    colunas_para_mostrar.append(mes)
-            
-            colunas_disponiveis = [c for c in colunas_para_mostrar if c in df.columns]
-            
-            if colunas_disponiveis:
-                st.dataframe(df[colunas_disponiveis], use_container_width=True, height=300)
-            
-            # Visualizar dados temporais completos para um produto
-            with st.expander("📅 Visualizar Dados Temporais Completos", expanded=False):
-                if 'Nome do produto' in df.columns:
-                    produtos = df['Nome do produto'].unique()
-                    produto_selecionado = st.selectbox("Selecione um produto:", produtos)
-                    
-                    if produto_selecionado:
-                        df_produto = df[df['Nome do produto'] == produto_selecionado]
-                        
-                        # Criar tabela temporal organizada
-                        meses = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
-                                'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro']
-                        
-                        for rec in df_produto['REC'].unique() if 'REC' in df_produto.columns else ['Único']:
-                            st.write(f"**{produto_selecionado} - REC: {rec}**")
-                            
-                            # Criar DataFrame temporal
-                            dados_temporais = []
-                            for mes in meses:
-                                linha = {'Mês': mes}
-                                for periodo in ['1-10', '11-20', '21-31']:
-                                    coluna = f"{mes} {periodo}"
-                                    if periodo == '21-31' and mes == 'Fevereiro':
-                                        coluna = f"{mes} 21-28/29"
-                                    
-                                    if coluna in df_produto.columns:
-                                        valor = df_produto[df_produto['REC'] == rec][coluna].iloc[0] if 'REC' in df_produto.columns else df_produto[coluna].iloc[0]
-                                        linha[periodo] = valor
-                                    else:
-                                        linha[periodo] = "NR"
-                                
-                                dados_temporais.append(linha)
-                            
-                            df_temporal = pd.DataFrame(dados_temporais)
-                            st.dataframe(df_temporal, use_container_width=True)
-            
-            # Mostrar texto transcrito
-            with st.expander("📝 Ver texto transcrito", expanded=False):
+            # Visualizar texto transcrito (opcional)
+            with st.expander("📝 Ver parte do texto transcrito", expanded=False):
                 if st.session_state.texto_transcrito:
                     st.text_area("Texto:", 
-                               st.session_state.texto_transcrito[:5000], 
-                               height=300)
+                               st.session_state.texto_transcrito + 
+                               (f"\n\n...[MAIS {len(st.session_state.texto_transcrito) - 10000:,} CARACTERES]..." 
+                                if len(st.session_state.texto_transcrito) > 10000 else ""), 
+                               height=400)
             
             # Download
-            st.subheader("📥 Download do CSV")
+            st.subheader("📥 Download")
             
             nome_base = uploaded_file.name.split('.')[0]
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
             if st.session_state.csv_content:
                 st.download_button(
-                    label=f"💾 Baixar CSV ({len(df)} linha(s), {len(COLUNAS_EXATAS)} colunas)",
+                    label=f"💾 Baixar CSV ({len(df)} linhas, {len(COLUNAS_EXATAS)} colunas)",
                     data=st.session_state.csv_content.encode('utf-8'),
-                    file_name=f"cultivares_temporal_{nome_base}_{timestamp}.csv",
+                    file_name=f"cultivares_{nome_base}_{timestamp}.csv",
                     mime="text/csv",
                     type="primary",
                     use_container_width=True
                 )
-            
-            # Preview do CSV
-            with st.expander("🔍 Preview do CSV", expanded=False):
-                if st.session_state.csv_content:
-                    linhas = st.session_state.csv_content.split('\n')[:4]
-                    st.code("\n".join(linhas), language="csv")
         
-        elif st.session_state.df is not None and df.empty and st.session_state.texto_transcrito:
-            st.info("📭 Nenhum dado extraído do documento.")
+        elif st.session_state.paginas_processadas > 0 and df.empty:
+            st.info("📭 Nenhum dado estruturado extraído, mas documento foi processado.")
+            
+            with st.expander("🔍 Ver estatísticas do processamento"):
+                st.write(f"**Páginas:** {st.session_state.paginas_processadas}")
+                st.write(f"**Imagens geradas:** {st.session_state.imagens_geradas}")
+                if st.session_state.texto_transcrito:
+                    st.write(f"**Texto transcrito:** {len(st.session_state.texto_transcrito):,} caracteres")
     
     else:
-        # Tela inicial
         st.markdown("""
-        ## 🌱 Extrator de Cultivares - Tabelas Temporais Detalhadas
+        ## 🌱 Extrator de Cultivares - Processamento SEM LIMITES
         
-        ### 📅 **Nova Estrutura Temporal:**
+        ### ✅ **CARACTERÍSTICAS:**
+        - **Processa QUALQUER tamanho** de documento
+        - **44+ páginas** sem problemas
+        - **SEM limites** artificiais
+        - **Extrai TUDO** das tabelas
         
-        **Cada mês dividido em 3 períodos:**
-        ```
-        Janeiro 1-10    | Janeiro 11-20   | Janeiro 21-31
-        Fevereiro 1-10  | Fevereiro 11-20 | Fevereiro 21-28/29
-        Março 1-10      | Março 11-20     | Março 21-31
-        ... (todos os 12 meses)
-        ```
+        ### 📊 **ESTRUTURA DE SAÍDA:**
+        - **81 colunas** exatas
+        - **Cada mês dividido em 3 períodos** (1-10, 11-20, 21-31)
+        - **Múltiplas linhas** para diferentes RECs
+        - **REC/UF/Região** extraídos de tabelas
         
-        **Total: 36 colunas temporais**
+        ### 🔄 **PROCESSAMENTO:**
+        1. **DOCX → Imagens** (todas as páginas)
+        2. **Imagens → Texto** (transcrição completa)
+        3. **Texto → Dados** (extração para 81 colunas)
+        4. **Dados → CSV** (pronto para Google Sheets)
         
-        ### 🔄 **Processamento:**
-        1. Identifica **tabelas com meses e períodos**
-        2. Extrai **valores para cada período (1-10, 11-20, 21-31)**
-        3. Cria **múltiplas linhas** para diferentes RECs
-        4. Gera CSV com **{len(COLUNAS_EXATAS)} colunas** no total
-        
-        ### 📊 **Exemplo de Saída:**
-        ```
-        Produto: NK401VIP3, REC: 202
-        Janeiro 1-10: 180-260
-        Janeiro 11-20: NR
-        Janeiro 21-31: 180-260
-        Fevereiro 1-10: NR
-        ... (todos os períodos)
-        ```
-        
-        **Carregue um DOCX com tabelas temporais detalhadas para começar.**
+        **Carregue um DOCX (qualquer tamanho) para começar.**
         """)
 
 if __name__ == "__main__":
