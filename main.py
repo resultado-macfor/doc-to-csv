@@ -168,7 +168,7 @@ def extrair_dados_para_csv(texto_transcrito):
     ANALISE O TEXTO TRANSCRITO DE UM DOCUMENTO SOBRE CULTIVARES:
 
     TEXTO:
-    {texto_transcrito[:10000]}
+    {texto_transcrito}
 
     EXTRAIA OS DADOS PARA ESTAS 81 COLUNAS EXATAS:
 
