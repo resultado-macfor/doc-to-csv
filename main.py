@@ -32,6 +32,13 @@ except Exception as e:
     st.error(f"Erro ao configurar Gemini: {str(e)}")
     st.stop()
 
+# Criar lista de meses detalhados
+meses_detalhados = []
+for mes in ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", 
+            "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]:
+    for num in ["1", "2", "3"]:  # Janeiro 1, Janeiro 2, Janeiro 3, etc.
+        meses_detalhados.append(f"{mes} {num}")
+
 # COLUNAS EXATAS conforme o template
 COLUNAS_EXATAS = [
     "Cultura", "Nome do produto", "NOME TÉCNICO/ REG", "Descritivo para SEO", 
@@ -52,9 +59,11 @@ COLUNAS_EXATAS = [
     "Resultado 4 - Local", "Resultado 4", "Resultado 5 - Nome", "Resultado 5 - Lcal", 
     "Resultado 5", "Resultado 6 - Nome", "Resultado 6 - Local", "Resultado 6", 
     "Resultado 7 - Nome", "Resultado 7 - Local", "Resultado 7", "REC", "UF", 
-    "Região", "Mês 1", "Mês 2", "Mês 3", "Mês 4", "Mês 5", "Mês 6", "Mês 7", 
-    "Mês 8", "Mês 9", "Mês 10", "Mês 11", "Mês 12"
-]
+    "Região"
+] + meses_detalhados  # Adicionar os 36 meses detalhados (12 meses × 3)
+
+print(f"Total de colunas: {len(COLUNAS_EXATAS)}")
+print(f"Meses detalhados: {meses_detalhados}")
 
 # Session state
 if 'df' not in st.session_state:
@@ -218,12 +227,19 @@ def extrair_dados_para_csv(texto_transcrito):
        - Se houver múltiplas cultivares no mesmo texto, crie uma entrada para cada
 
     2. FOCO NO CAMPO "REC" (CRÍTICO):
-       - Procure por: "REC", "Registro", "RDC", "Nº", "No.", "Número"
-       - Padrões: "REC 20205", "Registro: 30456", "RDC 12345", "Nº 67890"
-       - Geralmente são 5 dígitos: 12345, 20205, 30456
-       - Extraia APENAS os números: "REC 20205" → "20205"
+       - Procure por: "REC", que estará em uma tabelinha
+       - Se uma cultivar tiver MAIS DE UM REC, crie uma LINHA SEPARADA para cada REC
+       - Exemplo: Se cultivar "XYZ" tem REC 123 e REC 456, crie 2 linhas:
+         Linha 1: Cultivar XYZ, REC 123, ...
+         Linha 2: Cultivar XYZ, REC 456, ...
 
-    3. PARA OUTROS CAMPOS IMPORTANTES:
+    3. PARA OS MESES (36 colunas detalhadas):
+       - Formato: "Janeiro 1", "Janeiro 2", "Janeiro 3", "Fevereiro 1", ..., "Dezembro 3"
+       - Preencha com "X" se for recomendado plantar nesse período específico
+       - Deixe em branco ("") se não for recomendado
+       - Se a informação não estiver disponível, use "NR"
+
+    4. PARA OUTROS CAMPOS IMPORTANTES:
        - "Cultura": Soja, Milho, Feijão, Trigo, etc.
        - "Nome do produto": Nome comercial
        - "Região (por extenso)": Sul, Sudeste, Centro-Oeste, Nordeste, Norte
@@ -234,38 +250,56 @@ def extrair_dados_para_csv(texto_transcrito):
        - Resistências: R (Resistente), MR (Moderadamente Resistente), S (Suscetível)
        - Produtividade: Mantenha formato "XX,XX sc/ha" ou "kg/ha"
 
-    4. PARA OS MESES (Mês 1 a Mês 12):
-       - Procure por "Época de plantio", "Semeadura", "Período"
-       - Formato: "outubro-novembro" ou "10-11"
-       - Se for intervalo: "setembro a dezembro" → preencher Mês 9, 10, 11, 12
-       - Use "X" para meses recomendados, "" para não recomendados
-
     5. REGRAS GERAIS:
        - Use "NR" para informações não encontradas
-       - Mantenha os nomes das colunas EXATAMENTE como estão
+       - Mantenha os nomes das colunas EXATAMENTE como estão acima
        - Para campos numéricos, mantenha unidades quando aplicável
        - Para múltiplos valores, separe com vírgula
+       - Para campos de texto, mantenha o texto original
 
     6. FORMATO DE SAÍDA:
        - Retorne APENAS um array JSON válido
-       - Cada objeto representa uma cultivar
+       - Cada objeto representa uma cultivar + REC (uma linha no CSV)
        - Cada objeto deve ter {len(COLUNAS_EXATAS)} propriedades
        - Nomes das propriedades DEVEM ser exatos
+       - Inclua TODAS as propriedades, mesmo que vazias
 
-    EXEMPLO DE SAÍDA:
+    EXEMPLO DE SAÍDA PARA UMA CULTIVAR COM 2 RECs:
     [
       {{
         "Cultura": "Soja",
         "Nome do produto": "BRS 8380",
         "NOME TÉCNICO/ REG": "BRS 8380 IPRO",
-        "REC": "20205",
+        "REC": "12345",
         "Região (por extenso)": "Sul,Sudeste",
         "Estado (por extenso)": "Rio Grande do Sul,Paraná,São Paulo",
         "Ciclo": "Médio",
         "Lançamento": "2020",
-        "Mês 1": "X",
-        "Mês 2": "X",
-        "Mês 3": "",
+        "Janeiro 1": "X",
+        "Janeiro 2": "X",
+        "Janeiro 3": "",
+        "Fevereiro 1": "X",
+        "Fevereiro 2": "",
+        "Fevereiro 3": "",
+        ... // todas as outras 36 colunas de meses
+        ... // todas as outras colunas
+      }},
+      {{
+        "Cultura": "Soja",
+        "Nome do produto": "BRS 8380",
+        "NOME TÉCNICO/ REG": "BRS 8380 IPRO",
+        "REC": "67890",
+        "Região (por extenso)": "Centro-Oeste",
+        "Estado (por extenso)": "Mato Grosso,Goiás",
+        "Ciclo": "Médio",
+        "Lançamento": "2020",
+        "Janeiro 1": "",
+        "Janeiro 2": "",
+        "Janeiro 3": "",
+        "Fevereiro 1": "X",
+        "Fevereiro 2": "X",
+        "Fevereiro 3": "X",
+        ... // todas as outras 36 colunas de meses
         ... // todas as outras colunas
       }}
     ]
@@ -289,8 +323,10 @@ def extrair_dados_para_csv(texto_transcrito):
         try:
             dados = json.loads(resposta_limpa)
             if isinstance(dados, list):
+                st.info(f"✅ Extraídos {len(dados)} registro(s) (incluindo múltiplos RECs)")
                 return dados
             elif isinstance(dados, dict):
+                st.info(f"✅ Extraído 1 registro")
                 return [dados]
             else:
                 st.warning(f"Formato inesperado: {type(dados)}")
@@ -309,6 +345,7 @@ def extrair_dados_para_csv(texto_transcrito):
                     json_str = re.sub(r',\s*}', '}', json_str)  # Remover vírgulas antes de }
                     json_str = re.sub(r',\s*]', ']', json_str)  # Remover vírgulas antes de ]
                     dados = json.loads(json_str)
+                    st.info(f"✅ Extraídos {len(dados)} registro(s) após limpeza")
                     return dados
                 except Exception as e:
                     st.warning(f"Erro ao parsear array extraído: {str(e)}")
@@ -326,6 +363,7 @@ def extrair_dados_para_csv(texto_transcrito):
                     except:
                         continue
                 if dados:
+                    st.info(f"✅ Extraídos {len(dados)} registro(s) de múltiplos objetos")
                     return dados
             
             # Última tentativa: usar eval com segurança
@@ -340,6 +378,7 @@ def extrair_dados_para_csv(texto_transcrito):
                     
                     dados = json.loads(corrigido)
                     if isinstance(dados, list):
+                        st.info(f"✅ Extraídos {len(dados)} registro(s) após correção")
                         return dados
             except:
                 pass
@@ -351,7 +390,7 @@ def extrair_dados_para_csv(texto_transcrito):
         st.error(f"Erro na extração: {str(e)}")
         return []
 
-# Função 4: Criar DataFrame
+# Função 4: Criar DataFrame com tratamento de múltiplos RECs
 def criar_dataframe(dados):
     if not dados or not isinstance(dados, list):
         return pd.DataFrame(columns=COLUNAS_EXATAS)
@@ -385,10 +424,22 @@ def criar_dataframe(dados):
                 elif not isinstance(valor, str):
                     valor = str(valor)
                 
-                linha[coluna] = valor.strip() if valor.strip() != "" else "NR"
+                # Para campos de meses, manter "X", "" ou "NR"
+                if coluna in meses_detalhados:
+                    if valor.strip().upper() in ["X", "SIM", "YES", "V", "✓", "✔"]:
+                        valor = "X"
+                    elif valor.strip() == "":
+                        valor = ""
+                    elif valor.strip().upper() == "NR":
+                        valor = "NR"
+                
+                linha[coluna] = valor.strip() if isinstance(valor, str) and valor.strip() != "" else valor
             
-            # Adicionar apenas se tiver dados válidos
-            valores_validos = [v for v in linha.values() if v != "NR"]
+            # Verificar se tem REC
+            rec_valor = linha.get("REC", "NR")
+            
+            # Adicionar apenas se tiver dados válidos E um REC (ou pelo menos algum dado)
+            valores_validos = [v for v in linha.values() if v != "NR" and v != ""]
             if valores_validos:
                 linhas.append(linha)
     
@@ -400,8 +451,18 @@ def criar_dataframe(dados):
             if col not in df.columns:
                 df[col] = "NR"
         
+        # Para colunas de meses, substituir "NR" por "" (vazio)
+        for mes_col in meses_detalhados:
+            if mes_col in df.columns:
+                df[mes_col] = df[mes_col].apply(lambda x: "" if x == "NR" else x)
+        
         # Ordenar colunas
         df = df[COLUNAS_EXATAS]
+        
+        # Ordenar por Cultura e REC
+        if 'Cultura' in df.columns and 'REC' in df.columns:
+            df = df.sort_values(['Cultura', 'REC']).reset_index(drop=True)
+        
         return df
     else:
         return pd.DataFrame(columns=COLUNAS_EXATAS)
@@ -421,9 +482,18 @@ def gerar_csv_para_gsheets(df):
     for _, row in df.iterrows():
         linha = []
         for col in COLUNAS_EXATAS:
-            valor = str(row.get(col, "NR")).strip()
-            if valor in ["", "nan", "None", "null", "NaN", "<NA>", "NaT"]:
-                valor = "NR"
+            valor = row.get(col)
+            if pd.isna(valor) or valor is None:
+                valor = ""
+            elif isinstance(valor, str):
+                valor = valor.strip()
+            else:
+                valor = str(valor).strip()
+            
+            # Para colunas vazias, manter vazio
+            if valor in ["nan", "None", "null", "NaN", "<NA>", "NaT", "NR"]:
+                valor = ""
+            
             linha.append(valor)
         writer.writerow(linha)
     
@@ -445,9 +515,46 @@ def mostrar_previa_paginas(imagens, max_preview=5):
     if len(imagens) > max_preview:
         st.info(f"... e mais {len(imagens) - max_preview} página(s)")
 
+# Função 7: Verificar dados de RECs
+def verificar_recs(df):
+    if df.empty or 'REC' not in df.columns:
+        return
+    
+    # Contar RECs únicos
+    recs_validos = df[df['REC'] != '']['REC'].unique()
+    recs_validos = [str(r).strip() for r in recs_validos if str(r).strip() != '']
+    
+    if recs_validos:
+        st.markdown("### 🔍 Análise de RECs:")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("RECs Únicos Encontrados", len(recs_validos))
+        
+        with col2:
+            # Verificar múltiplos RECs por cultivar
+            if 'Nome do produto' in df.columns:
+                produtos_multiplos = []
+                for produto in df['Nome do produto'].unique():
+                    recs_produto = df[df['Nome do produto'] == produto]['REC'].unique()
+                    recs_validos_produto = [r for r in recs_produto if str(r).strip() not in ['', 'NR']]
+                    if len(recs_validos_produto) > 1:
+                        produtos_multiplos.append(produto)
+                
+                st.metric("Cultivares com Múltiplos RECs", len(produtos_multiplos))
+        
+        # Mostrar alguns RECs
+        with st.expander("Ver lista de RECs encontrados"):
+            for i, rec in enumerate(recs_validos[:20]):  # Mostrar até 20
+                st.write(f"• {rec}")
+            if len(recs_validos) > 20:
+                st.info(f"... e mais {len(recs_validos) - 20} RECs")
+
 # Interface principal
 def main():
     st.markdown("### 📤 Carregue um arquivo PDF com informações de cultivares")
+    st.markdown(f"**Total de colunas no template: {len(COLUNAS_EXATAS)}**")
     
     uploaded_file = st.file_uploader(
         "Selecione um arquivo PDF:",
@@ -516,16 +623,11 @@ def main():
                             # Gerar CSV
                             csv_content = gerar_csv_para_gsheets(df)
                             st.session_state.csv_content = csv_content
-                            st.success(f"✅ {len(df)} cultivar(s) extraída(s) com sucesso!")
+                            st.success(f"✅ {len(df)} linha(s) extraída(s) com sucesso!")
                             
                             # Verificar campos importantes
-                            campos_importantes = ['REC', 'Cultura', 'Nome do produto', 'Região (por extenso)']
-                            for campo in campos_importantes:
-                                if campo in df.columns:
-                                    valores_unicos = df[campo].unique()
-                                    valores_validos = [v for v in valores_unicos if v != "NR"]
-                                    if valores_validos:
-                                        st.info(f"**{campo}**: {len(valores_validos)} valor(es) encontrado(s)")
+                            verificar_recs(df)
+                            
                         else:
                             st.warning("⚠️ DataFrame vazio após processamento")
                     else:
@@ -539,18 +641,18 @@ def main():
         
         if not df.empty:
             st.markdown("---")
-            st.markdown(f"### 📋 Resultados: {len(df)} cultivar(s) encontrada(s)")
+            st.markdown(f"### 📋 Resultados: {len(df)} linha(s) encontrada(s)")
             
             # Estatísticas
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Total de Cultivares", len(df))
+                st.metric("Total de Linhas", len(df))
             with col2:
-                campos_preenchidos = sum([1 for col in df.columns if df[col].nunique() > 1])
+                campos_preenchidos = sum([1 for col in df.columns if df[col].nunique() > 1 and not df[col].isna().all()])
                 st.metric("Campos Preenchidos", f"{campos_preenchidos}/{len(COLUNAS_EXATAS)}")
             with col3:
                 if 'REC' in df.columns:
-                    rec_validos = sum([1 for val in df['REC'] if val != 'NR'])
+                    rec_validos = sum([1 for val in df['REC'] if str(val).strip() not in ['', 'NR']])
                     st.metric("RECs Válidos", rec_validos)
             with col4:
                 if 'Cultura' in df.columns:
@@ -562,20 +664,24 @@ def main():
                 texto_resumido = st.session_state.texto_transcrito[:5000] + "..." if len(st.session_state.texto_transcrito) > 5000 else st.session_state.texto_transcrito
                 st.text_area("Texto extraído:", texto_resumido, height=300)
             
+            # Mostrar amostra dos dados de meses
+            with st.expander("📅 Ver amostra dos dados de meses"):
+                if any(mes in df.columns for mes in meses_detalhados):
+                    meses_cols = [col for col in meses_detalhados if col in df.columns]
+                    if meses_cols:
+                        meses_sample = df[['Cultura', 'Nome do produto', 'REC'] + meses_cols[:6]].head(5)
+                        st.dataframe(meses_sample, use_container_width=True)
+            
             # Mostrar DataFrame
             st.markdown("### 📊 Dados Extraídos")
-            st.dataframe(df, use_container_width=True)
             
-            # Mostrar valores únicos de REC se existirem
-            if 'REC' in df.columns:
-                rec_values = df['REC'].unique()
-                valid_recs = [v for v in rec_values if v != 'NR']
-                if valid_recs:
-                    st.markdown("### 🔍 Valores de REC Encontrados:")
-                    for rec in valid_recs[:10]:  # Mostrar apenas os primeiros 10
-                        st.code(f"REC: {rec}", language="text")
-                    if len(valid_recs) > 10:
-                        st.info(f"... e mais {len(valid_recs) - 10} outros")
+            # Filtrar colunas para visualização (excluir colunas vazias)
+            colunas_nao_vazias = [col for col in COLUNAS_EXATAS if col in df.columns and not df[col].isna().all() and df[col].nunique() > 1]
+            
+            if len(colunas_nao_vazias) < len(COLUNAS_EXATAS):
+                st.info(f"Mostrando {len(colunas_nao_vazias)} colunas com dados (de {len(COLUNAS_EXATAS)} total)")
+            
+            st.dataframe(df[colunas_nao_vazias] if colunas_nao_vazias else df, use_container_width=True)
             
             # Download
             st.markdown("---")
@@ -635,27 +741,27 @@ def main():
         
         # Exemplo de uso
         with st.expander("ℹ️ Como usar esta ferramenta"):
-            st.markdown("""
+            st.markdown(f"""
             ### 📋 Fluxo de Processamento:
             
             1. **Carregue um PDF** com informações de cultivares agrícolas
             2. **Conversão automática**: Cada página vira uma imagem
             3. **Transcrição com IA**: Gemini Vision extrai texto das imagens
-            4. **Extração estruturada**: IA identifica e organiza os dados
-            5. **Geração de CSV**: Dados formatados para 81 colunas específicas
+            4. **Extração estruturada**: IA identifica e organiza os dados em {len(COLUNAS_EXATAS)} colunas
+            5. **Geração de CSV**: Dados formatados para planilha
             
-            ### 🔍 O que buscar no PDF:
+            ### 🔍 Dados extraídos:
             - **Nomes de cultivares** (BRS, SYN, DM, etc.)
-            - **Números de REC/Registro** (5 dígitos, ex: 20205)
+            - **Números de REC/Registro** (cada REC em linha separada)
+            - **36 períodos de plantio** (Janeiro 1 a Dezembro 3)
             - **Características técnicas** (ciclo, fertilidade, resistências)
             - **Regiões e estados** recomendados
-            - **Épocas de plantio** (meses)
-            - **Dados de produtividade** (sc/ha, kg/ha)
             
             ### ⚠️ Observações:
             - Processamento pode levar alguns minutos para PDFs grandes
             - Imagens de melhor qualidade = melhor reconhecimento
             - Verifique sempre os dados extraídos
+            - Cada REC gera uma linha separada no CSV
             """)
 
 if __name__ == "__main__":
