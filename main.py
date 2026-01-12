@@ -124,7 +124,7 @@ def docx_para_imagens_completas(docx_bytes):
         total_caracteres = len(texto_completo)
         
         # Calcular número de páginas (sem limite)
-        caracteres_por_pagina = 4000  # Mais espaço por imagem
+        caracteres_por_pagina = 400000000000  # Mais espaço por imagem
         num_paginas = max(1, math.ceil(total_caracteres / caracteres_por_pagina))
         
         st.info(f"📄 Documento original: {total_caracteres:,} caracteres")
