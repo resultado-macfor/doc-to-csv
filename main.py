@@ -24,13 +24,13 @@ if not gemini_api_key:
 
 try:
     genai.configure(api_key=gemini_api_key)
-    modelo_visao = genai.GenerativeModel("gemini-2.5-flash")
-    modelo_texto = genai.GenerativeModel("gemini-2.5-flash")
+    modelo_visao = genai.GenerativeModel("gemini-2.0-flash-exp")
+    modelo_texto = genai.GenerativeModel("gemini-1.5-flash")
 except Exception as e:
     st.error(f"Erro ao configurar Gemini: {str(e)}")
     st.stop()
 
-# Colunas para Google Sheets (81 colunas)
+# Colunas EXATAS para Google Sheets (81 colunas conforme exemplo)
 COLUNAS = [
     "Cultura", "Nome do produto", "NOME TÉCNICO/ REG", "Descritivo para SEO", 
     "Fertilidade", "Grupo de maturação", "Lançamento", "Slogan", "Tecnologia", 
@@ -64,9 +64,9 @@ if 'imagens' not in st.session_state:
 if 'texto' not in st.session_state:
     st.session_state.texto = ""
 
-# Função 1: Converter DOCX para imagens
-def docx_para_imagens(docx_bytes):
-    """Converte DOCX para lista de imagens (páginas)"""
+# Função 1: Converter DOCX para texto diretamente
+def docx_para_texto(docx_bytes):
+    """Converte DOCX diretamente para texto preservando estrutura"""
     try:
         with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
             tmp.write(docx_bytes)
@@ -74,196 +74,305 @@ def docx_para_imagens(docx_bytes):
         
         doc = docx.Document(docx_path)
         
-        # Extrair todo o texto
+        # Extrair todo o texto com estrutura
         textos = []
+        
+        # Extrair parágrafos
         for para in doc.paragraphs:
             if para.text.strip():
                 textos.append(para.text.strip())
         
+        # Extrair tabelas com formatação
         for table in doc.tables:
-            for row in table.rows:
-                cells_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                if cells_text:
-                    textos.append(" | ".join(cells_text))
+            tabela_texto = []
+            for i, row in enumerate(table.rows):
+                linha = []
+                for cell in row.cells:
+                    if cell.text.strip():
+                        linha.append(cell.text.strip())
+                if linha:
+                    tabela_texto.append(" | ".join(linha))
+            if tabela_texto:
+                textos.append("--- TABELA ---")
+                textos.extend(tabela_texto)
+                textos.append("--- FIM TABELA ---")
         
         texto_completo = "\n".join(textos)
         os.unlink(docx_path)
         
-        # Dividir em páginas (máximo 1500 caracteres por página)
-        paginas = []
-        pagina_atual = []
-        chars_contador = 0
-        
-        for linha in texto_completo.split('\n'):
-            linha_comprimento = len(linha)
-            if chars_contador + linha_comprimento > 1500 and pagina_atual:
-                paginas.append("\n".join(pagina_atual))
-                pagina_atual = [linha]
-                chars_contador = linha_comprimento
-            else:
-                pagina_atual.append(linha)
-                chars_contador += linha_comprimento
-        
-        if pagina_atual:
-            paginas.append("\n".join(pagina_atual))
-        
-        # Criar imagens
-        imagens = []
-        for texto in paginas:
-            # Criar imagem com fundo branco
-            img = Image.new('RGB', (1200, 1600), color='white')
-            draw = ImageDraw.Draw(img)
-            
-            # Tentar carregar fonte
-            try:
-                font = ImageFont.truetype("arial.ttf", 14)
-            except:
-                font = ImageFont.load_default()
-            
-            # Adicionar texto
-            y = 50
-            for linha in texto.split('\n'):
-                if linha.strip() and y < 1550:
-                    # Quebrar linhas muito longas
-                    for i in range(0, len(linha), 100):
-                        if y < 1550:
-                            parte = linha[i:i+100]
-                            draw.text((50, y), parte, fill='black', font=font)
-                            y += 25
-            
-            imagens.append(img)
-        
-        return imagens
+        return texto_completo
         
     except Exception as e:
         st.error(f"Erro na conversão DOCX: {str(e)}")
-        return []
-
-# Função 2: Transcrever imagens com Gemini Vision
-def transcrever_imagens(imagens):
-    """Transcreve imagens usando modelo de visão"""
-    if not imagens:
         return ""
-    
-    texto_completo = ""
-    progress_bar = st.progress(0)
-    
-    for i, imagem in enumerate(imagens):
-        progresso = (i + 1) / len(imagens)
-        progress_bar.progress(progresso)
-        
-        try:
-            # Converter imagem para bytes
-            img_bytes = io.BytesIO()
-            imagem.save(img_bytes, format='PNG')
-            img_bytes = img_bytes.getvalue()
-            
-            # Prompt para transcrição completa
-            prompt = """TRANSCREVA TODO o texto desta imagem. Inclua:
-            - Tabelas completas
-            - Números e valores
-            - Nomes de produtos/cultivares
-            - Estados e regiões
-            - Características técnicas
-            - Benefícios mencionados
-            - Resultados de produtividade
-            - Tudo que estiver escrito na imagem"""
-            
-            response = modelo_visao.generate_content([
-                prompt,
-                {"mime_type": "image/png", "data": img_bytes}
-            ])
-            
-            texto_completo += f"\n\n--- PÁGINA {i+1} ---\n{response.text}\n"
-            time.sleep(0.5)  # Pausa para não sobrecarregar API
-            
-        except Exception as e:
-            texto_completo += f"\n\n--- ERRO PÁGINA {i+1}: {str(e)[:100]} ---\n"
-    
-    progress_bar.empty()
-    return texto_completo
 
-# Função 3: Extrair dados para CSV
-def extrair_dados_para_csv(texto_transcrito):
-    """Extrai dados do texto para o formato CSV"""
+# Função 2: Melhorar transcrição com prompts específicos
+def transcrever_texto(texto_original):
+    """Melhora e organiza o texto extraído para análise"""
     
     prompt = f"""
-    ANALISE O TEXTO ABAIXO QUE FOI EXTRAÍDO DE UM DOCUMENTO SOBRE CULTIVARES.
+    Você é um especialista em processamento de documentos técnicos de agricultura.
     
-    TEXTO TRANSCRITO:
-    {texto_transcrito}
+    TEXTO ORIGINAL EXTRAÍDO DO DOCUMENTO:
+    {texto_original}
     
     SUA TAREFA:
-    1. Identifique TODAS as cultivares mencionadas
-    2. Para CADA cultivar, extraia informações para estas 81 colunas:
+    1. Reorganize este texto mantendo TODA a informação
+    2. Identifique e separe claramente cada cultivar/produto
+    3. Para cada cultivar, estruture as informações em seções:
+       - Identificação (nome, cultura, tecnologia)
+       - Características técnicas (ciclo, fertilidade, grupo de maturação)
+       - Resistências a doenças
+       - Resultados de produtividade
+       - Recomendações
+       - Regiões/Estados recomendados
     
-    LISTA DE COLUNAS:
-    {', '.join(COLUNAS)}
+    4. PRESERVE todos os dados numéricos, nomes, siglas, resultados
+    5. Use marcadores claros como "=== CULTIVAR: [NOME] ===" para separar
     
-    RETORNE APENAS um array JSON. Cada objeto no array deve ter 81 propriedades
-    correspondentes às colunas acima. Use "NR" para informações não encontradas. Separe varios elementos identificados com ; - você está gerando um csv então utilizar vírgulas é problemático
+    Retorne apenas o texto reorganizado e estruturado.
     """
     
     try:
-        with st.spinner("Processando texto para extrair dados..."):
+        response = modelo_texto.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        st.error(f"Erro na estruturação do texto: {str(e)}")
+        return texto_original
+
+# Função 3: Extrair dados com prompt mais específico
+def extrair_dados_para_csv(texto_estruturado):
+    """Extrai dados do texto para o formato CSV com prompt detalhado"""
+    
+    prompt = f"""
+    ANALISE O TEXTO ESTRUTURADO ABAIXO E EXTRAIA TODOS OS DADOS PARA PREENCHER A PLANILHA DE CULTIVARES.
+
+    TEXTO ESTRUTURADO:
+    {texto_estruturado}
+
+    **INSTRUÇÕES CRÍTICAS:**
+
+    1. **IDENTIFIQUE CADA CULTIVAR ÚNICA** no documento. Cada cultivar deve ser uma linha na planilha.
+
+    2. **USE O EXEMPLO ABAIXO COMO REFERÊNCIA** para entender como preencher as colunas:
+
+    EXEMPLO DE LINHA PREENCHIDA:
+    Cultura: Soja
+    Nome do produto: NS7524IPRO
+    NOME TÉCNICO/ REG: 
+    Descritivo para SEO: 
+    Fertilidade: Alto
+    Grupo de maturação: 7.5
+    Lançamento: Sim
+    Slogan: Excelente performance produtiva com múltipla resistência a nematoides de cisto
+    Tecnologia: IPRO
+    Região (por extenso): Sul, Sudeste
+    Estado (por extenso): Santa Catarina, Paraná
+    Ciclo: Precoce
+    Finalidade: Grãos
+    URL da imagem do mapa: Ex: https://www.niderasementes.com.br/wp-content/uploads/2025/12/mapa_soja_niderasementes-1000x1000.jpg
+    Número do ícone: 1
+    Titulo icone 1: Ex: Alto retorno ao investimento
+    Descrição Icone 1: Altíssimo potencial produtivo; Indicada para alta tecnologia: no melhor talhão e com melhor manejo
+    Exigência à fertilidade: Médio e alto
+    Grupo de maturidade: 7.7 M3 | 7.8 M4 | 7.8 M5
+    PMS MÉDIO: 150G
+    Tipo de crescimento: Semideterminado
+    Cor da flor: Roxa
+    Cor da pubescência: Marrom média
+    Cor do hilo: Preto
+    Cancro da haste: R
+    Pústula bacteriana: MR
+    Nematoide das galhas - M. javanica: R
+    Nematóide de Cisto (Raça 3): R
+    Nematóide de Cisto (Raça 9): MR
+    Nematóide de Cisto (Raça 10): MR
+    Nematóide de Cisto (Raça 14): MR
+    Fitóftora (Raça 1): MR
+    Recomendações: Pode haver variação no ciclo (dias) devido às condições edafoclimáticas...
+    Resultado 1 - Nome: Fazenda Planalto
+    Resultado 1 - Local: Costa Rica - MS
+    Resultado 1: 106,0 sc/ha
+    Resultado 2 - Nome: Clodemir Paholski
+    Resultado 2 - Local: Cristalina - GO
+    Resultado 2: 85,0 sc/ha
+    Resultado 3 - Nome: Centro Sul Consultoria
+    Resultado 3 - Local: Formosa – GO
+    Resultado 3: 84,5 sc/ha
+    Resultado 4 - Nome: Antério Mânica
+    Resultado 4 - Local: Unaí - MG
+    Resultado 4: 84,0 sc/ha
+    Resultado 5 - Nome: Cislei Ribeiro dos Santos
+    Resultado 5 - Local: Bonfinópolis de Minas - MG
+    Resultado 5: 84,0 sc/ha
+    Resultado 6 - Nome: Djonas Kogler
+    Resultado 6 - Local: Formoso - MG
+    Resultado 6: 81,0 sc/ha
+    Resultado 7 - Nome: Cerrado Consultoria
+    Resultado 7 - Local: Unaí - MG
+    Resultado 7: 79,0 sc/ha
+    REC: 202
+    UF: RS, SC, PR, SP
+    Região: Sul, Sudeste
+    Mês 1: NR
+    Mês 2: NR
+    Mês 3: 180-260
+    Mês 4: 180-260
+    Mês 5: 180-260
+    Mês 6: 180-260
+    Mês 7: 180-260
+    Mês 8: 180-260
+    Mês 9: 180-260
+    Mês 10: 180-260
+    Mês 11: 180-260
+    Mês 12: NR
+
+    3. **PARA CADA CULTIVAR IDENTIFICADA**, preencha TODAS as 81 colunas listadas abaixo.
+
+    4. **COLUNAS QUE DEVEM SER PREENCHIDAS (81 no total):**
+    {', '.join(COLUNAS)}
+
+    5. **FORMATO DE RESPOSTA:**
+    Retorne APENAS um array JSON onde cada objeto representa uma cultivar.
+    Cada objeto deve ter EXATAMENTE 81 propriedades com os nomes das colunas acima.
+
+    6. **REGRA DE PREENCHIMENTO:**
+    - Para informações não encontradas, use "NR"
+    - Para múltiplos valores (como estados), separe com vírgula: "Santa Catarina, Paraná"
+    - Para resultados de produtividade, mantenha o formato: "106,0 sc/ha"
+    - Para resistências, use siglas: R (Resistente), MR (Moderadamente Resistente), S (Suscetível)
+    - Para meses de plantio, use formato "180-260" ou "NR"
+
+    7. **DICAS PARA EXTRAÇÃO:**
+    - "Nome do produto" geralmente começa com siglas como NS, TMG, BÔNUS
+    - "Cultura" geralmente é Soja, Milho, Algodão, etc.
+    - "Tecnologia" geralmente é IPRO, RR, Intacta, etc.
+    - "Grupo de maturação" geralmente é um número como 6.0, 7.5, 8.0
+    - "Ciclo" pode ser Precoce, Médio, Tardio
+    - Procure por tabelas de resultados com nomes, locais e produtividades
+    - Procure por listas de resistências a doenças
+
+    AGORA ANALISE O TEXTO E EXTRAIA OS DADOS PARA O ARRAY JSON:
+    """
+    
+    try:
+        with st.spinner("🔍 Extraindo dados de cada cultivar..."):
             response = modelo_texto.generate_content(prompt)
             resposta = response.text.strip()
             
             # Limpar resposta
-            resposta_limpa = resposta.replace('```json', '').replace('```', '').strip()
+            resposta_limpa = resposta.replace('```json', '').replace('```', '').replace('JSON', '').strip()
             
             # Tentar encontrar JSON
-            json_match = re.search(r'(\[.*\])', resposta_limpa, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-                dados = json.loads(json_str)
-                return dados
-            
-            # Tentar encontrar objeto único
-            obj_match = re.search(r'(\{.*\})', resposta_limpa, re.DOTALL)
-            if obj_match:
-                json_str = obj_match.group(1)
-                dados = [json.loads(json_str)]
-                return dados
-            
-            st.warning("Não foi possível extrair dados estruturados da resposta.")
-            return []
+            try:
+                # Tentar parse direto
+                dados = json.loads(resposta_limpa)
+                
+                # Verificar se é lista
+                if isinstance(dados, list):
+                    return dados
+                elif isinstance(dados, dict):
+                    # Se for objeto único, colocar em lista
+                    return [dados]
+                else:
+                    st.warning("Formato de resposta inesperado")
+                    return []
+                    
+            except json.JSONDecodeError:
+                # Tentar extrair JSON com regex
+                json_match = re.search(r'(\[.*\])', resposta_limpa, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                    dados = json.loads(json_str)
+                    return dados
+                
+                # Tentar objeto único
+                obj_match = re.search(r'(\{.*\})', resposta_limpa, re.DOTALL)
+                if obj_match:
+                    json_str = obj_match.group(1)
+                    dados = [json.loads(json_str)]
+                    return dados
+                
+                st.warning("Não foi possível extrair JSON da resposta")
+                st.info(f"Resposta recebida: {resposta_limpa[:500]}...")
+                return []
             
     except Exception as e:
         st.error(f"Erro na extração de dados: {str(e)}")
+        st.info(f"Resposta que causou erro: {resposta[:1000]}")
         return []
 
-# Função 4: Criar DataFrame
+# Função 4: Criar DataFrame com validação
 def criar_dataframe(dados):
-    """Cria DataFrame a partir dos dados extraídos"""
+    """Cria DataFrame a partir dos dados extraídos com validação"""
     if not dados or not isinstance(dados, list):
         return pd.DataFrame(columns=COLUNAS)
     
     linhas = []
-    for item in dados:
+    for idx, item in enumerate(dados):
         if isinstance(item, dict):
             linha = {}
             for coluna in COLUNAS:
-                valor = item.get(coluna)
-                if valor is None or valor == "":
-                    linha[coluna] = "NR"
+                # Obter valor com diferentes chaves possíveis
+                valor = None
+                
+                # Tentar diferentes variações do nome da coluna
+                possiveis_chaves = [
+                    coluna,
+                    coluna.lower(),
+                    coluna.upper(),
+                    coluna.replace(" ", "_"),
+                    coluna.replace("(", "").replace(")", "")
+                ]
+                
+                for chave in possiveis_chaves:
+                    if chave in item:
+                        valor = item[chave]
+                        break
+                
+                # Se não encontrou, usar NR
+                if valor is None or (isinstance(valor, str) and valor.strip() == ""):
+                    valor = "NR"
                 else:
-                    linha[coluna] = str(valor).strip()
-            linhas.append(linha)
+                    valor = str(valor).strip()
+                    
+                    # Tratar valores específicos
+                    if valor in ["nan", "None", "null", "NaN"]:
+                        valor = "NR"
+                    
+                    # Para colunas de meses, padronizar formato
+                    if coluna.startswith("Mês"):
+                        if "180-260" in valor or "180 a 260" in valor:
+                            valor = "180-260"
+                
+                linha[coluna] = valor
+            
+            # Validar linha mínima
+            if linha.get("Nome do produto", "NR") != "NR" and linha.get("Cultura", "NR") != "NR":
+                linhas.append(linha)
+            else:
+                st.warning(f"Linha {idx+1} ignorada: falta nome do produto ou cultura")
     
     if linhas:
-        return pd.DataFrame(linhas, columns=COLUNAS)
+        df = pd.DataFrame(linhas, columns=COLUNAS)
+        
+        # Garantir ordem das colunas
+        df = df[COLUNAS]
+        
+        return df
     else:
         return pd.DataFrame(columns=COLUNAS)
 
-# Função 5: Gerar CSV para Google Sheets
+# Função 5: Gerar CSV formatado corretamente
 def gerar_csv_para_gsheets(df):
-    """Gera CSV formatado para Google Sheets"""
+    """Gera CSV formatado para Google Sheets com tratamento especial"""
     if df.empty:
         return ""
     
     output = io.StringIO()
-    writer = csv.writer(output, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+    
+    # Configurar writer para preservar formato brasileiro
+    writer = csv.writer(output, delimiter=',', quotechar='"', quoting=csv.QUOTE_ALL)
     
     # Escrever cabeçalho
     writer.writerow(COLUNAS)
@@ -273,22 +382,37 @@ def gerar_csv_para_gsheets(df):
         linha = []
         for col in COLUNAS:
             valor = str(row.get(col, "NR")).strip()
-            # Tratar valores especiais
-            if valor in ["", "nan", "None", "null"]:
+            
+            # Tratamentos especiais
+            if valor == "":
                 valor = "NR"
+            elif valor in ["nan", "None", "null", "NaN"]:
+                valor = "NR"
+            
+            # Preservar vírgulas decimais (formato brasileiro)
+            if "sc/ha" in valor or "," in valor and valor.replace(",", "").replace(".", "").isdigit():
+                # Manter vírgula decimal
+                valor = valor
+            
             linha.append(valor)
+        
         writer.writerow(linha)
     
-    return output.getvalue()
+    csv_content = output.getvalue()
+    
+    # Substituir caracteres problemáticos
+    csv_content = csv_content.replace('"NR"', 'NR')
+    
+    return csv_content
 
 # Interface principal
 def main():
     st.sidebar.header("📤 Upload do Documento")
     
     uploaded_file = st.sidebar.file_uploader(
-        "Carregue um arquivo DOCX:",
+        "Carregue um arquivo DOCX técnico de cultivares:",
         type=["docx"],
-        help="Documento técnico sobre cultivares"
+        help="Documento contendo informações sobre cultivares/soja com tabelas, características e resultados"
     )
     
     if uploaded_file:
@@ -305,48 +429,58 @@ def main():
                 st.session_state.df = pd.DataFrame(columns=COLUNAS)
                 st.session_state.csv_content = ""
                 
-                # PASSO 1: Converter DOCX para imagens
-                with st.spinner("🖼️ Convertendo DOCX para imagens..."):
-                    imagens = docx_para_imagens(uploaded_file.getvalue())
-                    if imagens:
-                        st.session_state.imagens = imagens
-                        st.success(f"✅ {len(imagens)} página(s) criada(s)")
-                    else:
-                        st.error("Falha na conversão do DOCX")
+                with st.spinner("📄 Convertendo DOCX para texto..."):
+                    # PASSO 1: Converter DOCX para texto
+                    texto_original = docx_para_texto(uploaded_file.getvalue())
+                    
+                    if not texto_original or len(texto_original) < 100:
+                        st.error("Documento muito curto ou vazio")
                         return
+                    
+                    st.success(f"✅ Texto extraído ({len(texto_original):,} caracteres)")
+                    
+                    # Mostrar preview
+                    with st.expander("📝 Ver texto original extraído", expanded=False):
+                        st.text_area("Conteúdo:", texto_original[:3000] + ("..." if len(texto_original) > 3000 else ""), 
+                                   height=300, key="texto_original")
                 
-                # PASSO 2: Transcrever imagens
-                with st.spinner("👁️ Transcrevendo imagens com IA..."):
-                    texto = transcrever_imagens(imagens)
-                    if texto:
-                        st.session_state.texto = texto
-                        st.success(f"✅ Transcrição concluída")
-                        
-                        # Mostrar preview
-                        with st.expander("📝 Ver texto transcrito", expanded=False):
-                            st.text_area("Conteúdo:", texto[:2000] + ("..." if len(texto) > 2000 else ""), 
-                                       height=200, key="texto_preview")
-                    else:
-                        st.error("Falha na transcrição")
-                        return
+                with st.spinner("🧹 Estruturando e organizando texto..."):
+                    # PASSO 2: Melhorar estrutura do texto
+                    texto_estruturado = transcrever_texto(texto_original)
+                    st.session_state.texto = texto_estruturado
+                    st.success("✅ Texto estruturado")
+                    
+                    # Mostrar preview estruturado
+                    with st.expander("🧠 Ver texto estruturado", expanded=False):
+                        st.text_area("Texto Estruturado:", 
+                                   texto_estruturado[:4000] + ("..." if len(texto_estruturado) > 4000 else ""), 
+                                   height=400, key="texto_estruturado")
                 
-                # PASSO 3: Extrair dados
-                with st.spinner("📊 Extraindo dados para CSV..."):
-                    dados = extrair_dados_para_csv(texto)
+                with st.spinner("📊 Extraindo dados para 81 colunas..."):
+                    # PASSO 3: Extrair dados estruturados
+                    dados = extrair_dados_para_csv(texto_estruturado)
+                    
                     if dados:
+                        st.info(f"✅ {len(dados)} cultivar(s) identificada(s)")
+                        
+                        # PASSO 4: Criar DataFrame
                         df = criar_dataframe(dados)
                         st.session_state.df = df
-                        st.success(f"✅ {len(df)} cultivar(s) extraída(s)")
                         
-                        # Gerar CSV
-                        csv_content = gerar_csv_para_gsheets(df)
-                        st.session_state.csv_content = csv_content
+                        if not df.empty:
+                            st.success(f"✅ DataFrame criado com {len(df)} linha(s) e {len(df.columns)} coluna(s)")
+                            
+                            # PASSO 5: Gerar CSV
+                            csv_content = gerar_csv_para_gsheets(df)
+                            st.session_state.csv_content = csv_content
+                            st.success("✅ CSV gerado para Google Sheets")
+                        else:
+                            st.warning("⚠️ DataFrame vazio após processamento")
                     else:
-                        st.warning("⚠️ Nenhuma cultivar identificada")
-                        st.session_state.df = pd.DataFrame(columns=COLUNAS)
+                        st.error("❌ Nenhum dado extraído do documento")
         
         with col2:
-            if st.button("🔄 Limpar", use_container_width=True):
+            if st.button("🔄 Limpar Tudo", use_container_width=True):
                 st.session_state.imagens = []
                 st.session_state.texto = ""
                 st.session_state.df = pd.DataFrame(columns=COLUNAS)
@@ -361,50 +495,56 @@ def main():
             st.header("📊 Resultados - Pronto para Google Sheets")
             
             # Estatísticas
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Cultivares", len(df))
             with col2:
                 if 'Cultura' in df.columns:
-                    culturas = [c for c in df['Cultura'].unique() if c != "NR"]
-                    st.metric("Tipos", len(culturas))
+                    culturas_unicas = df['Cultura'].nunique()
+                    st.metric("Culturas", culturas_unicas)
             with col3:
-                st.metric("Colunas", len(df.columns))
+                tecnologias_unicas = df['Tecnologia'].nunique() if 'Tecnologia' in df.columns else 0
+                st.metric("Tecnologias", tecnologias_unicas)
+            with col4:
+                colunas_preenchidas = sum([1 for col in df.columns if df[col].astype(str).str.contains('NR').mean() < 0.8])
+                st.metric("Colunas Preenchidas", colunas_preenchidas)
             
             # Visualização dos dados
             st.subheader("👁️ Visualização dos Dados")
             
             # Selecionar colunas para mostrar
-            colunas_principais = [
+            colunas_importantes = [
                 'Cultura', 'Nome do produto', 'Tecnologia', 
-                'Grupo de maturação', 'Fertilidade', 'Estado (por extenso)'
+                'Grupo de maturação', 'Ciclo', 'Fertilidade',
+                'Estado (por extenso)', 'PMS MÉDIO'
             ]
             
-            colunas_disponiveis = [c for c in colunas_principais if c in df.columns]
+            colunas_disponiveis = [c for c in colunas_importantes if c in df.columns]
             
             if colunas_disponiveis:
                 st.dataframe(df[colunas_disponiveis], use_container_width=True, height=300)
-            else:
-                # Mostrar primeiras 10 colunas
-                st.dataframe(df.iloc[:, :10], use_container_width=True, height=300)
+            
+            # Botão para visualizar todas as colunas
+            with st.expander("👁️ Ver todas as 81 colunas", expanded=False):
+                st.dataframe(df, use_container_width=True, height=400)
             
             # Download
-            st.subheader("📥 Download")
+            st.subheader("📥 Download dos Arquivos")
             
             nome_base = uploaded_file.name.split('.')[0]
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
-            col_dl1, col_dl2 = st.columns(2)
+            col_dl1, col_dl2, col_dl3 = st.columns(3)
             
             with col_dl1:
                 # CSV para Google Sheets
                 if st.session_state.csv_content:
                     st.download_button(
-                        label="📄 Baixar CSV (Google Sheets)",
-                        data=st.session_state.csv_content,
+                        label="📄 Baixar CSV (81 colunas)",
+                        data=st.session_state.csv_content.encode('utf-8'),
                         file_name=f"cultivares_{nome_base}_{timestamp}.csv",
                         mime="text/csv",
-                        help="CSV pronto para importar no Google Sheets",
+                        help="CSV com 81 colunas pronto para importar no Google Sheets",
                         use_container_width=True
                     )
             
@@ -417,7 +557,7 @@ def main():
                     excel_data = excel_buffer.getvalue()
                     
                     st.download_button(
-                        label="📊 Baixar Excel",
+                        label="📊 Baixar Excel (.xlsx)",
                         data=excel_data,
                         file_name=f"cultivares_{nome_base}_{timestamp}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -425,77 +565,198 @@ def main():
                         use_container_width=True
                     )
             
-            # Instruções para Google Sheets
-            with st.expander("📋 Como usar no Google Sheets", expanded=False):
+            with col_dl3:
+                # JSON para depuração
+                if st.session_state.texto:
+                    st.download_button(
+                        label="📝 Baixar Texto Estruturado",
+                        data=st.session_state.texto,
+                        file_name=f"texto_estruturado_{nome_base}_{timestamp}.txt",
+                        mime="text/plain",
+                        help="Texto estruturado para análise",
+                        use_container_width=True
+                    )
+            
+            # Instruções detalhadas
+            with st.expander("📋 Instruções Detalhadas para Google Sheets", expanded=False):
                 st.markdown("""
-                1. **Vá para [Google Sheets](https://sheets.google.com)**
-                2. **Crie uma planilha em branco**
-                3. **Arquivo → Importar → Fazer upload**
-                4. **Selecione o arquivo CSV baixado**
-                5. **Configurações de importação:**
-                   - Separador: **Vírgula**
-                   - Codificação: **UTF-8**
-                   - Detectar automaticamente: **Sim**
-                6. **Clique em Importar dados**
+                ### 🚀 **Como importar para Google Sheets:**
                 
-                **Pronto!** Seus dados serão organizados em 81 colunas.
+                1. **Acesse [Google Sheets](https://sheets.google.com)**
+                2. **Crie uma nova planilha em branco**
+                3. **Clique em:**
+                   - **Arquivo → Importar → Fazer upload**
+                   - OU arraste o arquivo CSV para a interface do Google Sheets
+                
+                4. **Configurações de importação (IMPORTANTE):**
+                   ```
+                   Tipo de importação: Substituir planilha
+                   Separador: Vírgula (,)
+                   Codificação: UTF-8
+                   Detectar automaticamente: Sim
+                   ```
+                
+                5. **Clique em "Importar dados"**
+                
+                ### ✅ **O que você verá:**
+                - **81 colunas organizadas** conforme o template
+                - **Cada linha = uma cultivar** para o site
+                - **Dados prontos** para publicação
+                
+                ### 🔧 **Ajustes recomendados após importação:**
+                - Verifique as colunas de **Mês 1 a Mês 12** para ajustar períodos de plantio
+                - Confira os **resultados de produtividade** (sc/ha)
+                - Valide as **resistências a doenças** (R, MR, S)
                 """)
             
             # Preview do CSV
-            with st.expander("🔍 Preview do CSV gerado", expanded=False):
+            with st.expander("🔍 Preview do CSV gerado (primeiras 2 linhas)", expanded=False):
                 if st.session_state.csv_content:
                     linhas = st.session_state.csv_content.split('\n')[:3]
                     st.code("\n".join(linhas), language="csv")
+            
+            # Análise de qualidade
+            with st.expander("📈 Análise de Qualidade dos Dados", expanded=False):
+                if not df.empty:
+                    st.write("**Taxa de preenchimento por coluna:**")
+                    
+                    # Calcular preenchimento
+                    taxa_preenchimento = {}
+                    for coluna in COLUNAS[:20]:  # Mostrar apenas 20 primeiras
+                        if coluna in df.columns:
+                            total = len(df)
+                            nr_count = df[coluna].astype(str).str.contains('NR').sum()
+                            preenchido = total - nr_count
+                            taxa = (preenchido / total * 100) if total > 0 else 0
+                            taxa_preenchimento[coluna] = taxa
+                    
+                    # Criar DataFrame para visualização
+                    df_taxa = pd.DataFrame({
+                        'Coluna': list(taxa_preenchimento.keys()),
+                        'Preenchimento (%)': list(taxa_preenchimento.values())
+                    })
+                    
+                    st.dataframe(df_taxa, use_container_width=True, height=300)
+                    
+                    # Status geral
+                    taxa_media = sum(taxa_preenchimento.values()) / len(taxa_preenchimento) if taxa_preenchimento else 0
+                    
+                    if taxa_media > 70:
+                        st.success(f"✅ Qualidade boa: {taxa_media:.1f}% de preenchimento médio")
+                    elif taxa_media > 40:
+                        st.warning(f"⚠️ Qualidade moderada: {taxa_media:.1f}% de preenchimento médio")
+                    else:
+                        st.error(f"❌ Qualidade baixa: {taxa_media:.1f}% de preenchimento médio")
         
         elif df is not None and df.empty:
-            st.info("📭 Nenhum dado extraído do documento.")
+            st.info("📭 Nenhuma cultivar identificada no documento.")
+            
+            with st.expander("🔍 Depuração - Ver dados extraídos", expanded=False):
+                if st.session_state.texto:
+                    st.text_area("Texto para análise:", 
+                               st.session_state.texto[:2000], 
+                               height=300)
         
-        # Mostrar status do processamento
-        with st.expander("⚙️ Status do Processamento", expanded=False):
-            if st.session_state.imagens:
-                st.write(f"✅ **Imagens:** {len(st.session_state.imagens)} página(s)")
-            if st.session_state.texto:
-                st.write(f"✅ **Transcrição:** {len(st.session_state.texto):,} caracteres")
-            if st.session_state.df is not None:
-                st.write(f"✅ **DataFrame:** {len(st.session_state.df)} linha(s)")
+        # Mostrar pipeline completo
+        with st.expander("⚙️ Pipeline Completo", expanded=True):
+            st.markdown("""
+            ### 🔄 **Fluxo de Processamento Otimizado:**
+            
+            1. **📤 DOCX Original**  
+               → Extração direta de texto e tabelas
+            
+            2. **🧹 Estruturação com IA**  
+               → Identificação de cultivares individuais  
+               → Organização em seções lógicas
+            
+            3. **📊 Extração para 81 Colunas**  
+               → Mapeamento detalhado para cada campo  
+               → Validação de dados  
+               → Formatação padronizada
+            
+            4. **📄 CSV Final**  
+               → 81 colunas exatas conforme template  
+               → Pronto para Google Sheets  
+               → Cada linha = uma página no site
+            
+            **Status atual:**
+            """)
+            
+            status_col1, status_col2, status_col3, status_col4 = st.columns(4)
+            
+            with status_col1:
+                if st.session_state.texto:
+                    st.success("✅ Texto extraído")
+                else:
+                    st.info("📭 Aguardando")
+            
+            with status_col2:
+                if not st.session_state.df.empty:
+                    st.success(f"✅ {len(st.session_state.df)} cultivar(s)")
+                else:
+                    st.info("📭 Aguardando")
+            
+            with status_col3:
+                if st.session_state.csv_content:
+                    st.success("✅ CSV pronto")
+                else:
+                    st.info("📭 Aguardando")
+            
+            with status_col4:
+                if not st.session_state.df.empty:
+                    colunas_preenchidas = sum([1 for col in st.session_state.df.columns 
+                                             if st.session_state.df[col].astype(str).str.contains('NR').mean() < 0.8])
+                    st.metric("Colunas", f"{colunas_preenchidas}/81")
     
     else:
         # Tela inicial
         st.markdown("""
-        ## 🌱 Pipeline Completo: DOCX → Google Sheets
+        ## 🌱 Extrator de Cultivares - Pipeline Completo
         
-        ### 🔄 **Fluxo de Processamento:**
+        ### 🎯 **Objetivo:**
+        Transformar documentos técnicos de cultivares em planilhas estruturadas com **81 colunas específicas** para o site.
         
-        1. **📤 DOCX**  
-           → Carrega documento técnico
+        ### 📋 **Template de Saída (81 Colunas):**
         
-        2. **🖼️ Conversão para Imagens**  
-           → Cada página vira imagem PNG  
-           → Preserva formatação e tabelas
+        **Identificação:** Cultura, Nome do produto, NOME TÉCNICO/REG, Descritivo para SEO  
+        **Características:** Fertilidade, Grupo de maturação, Lançamento, Slogan, Tecnologia  
+        **Geografia:** Região (por extenso), Estado (por extenso)  
+        **Técnicas:** Ciclo, Finalidade, PMS MÉDIO, Tipo de crescimento  
+        **Resistências:** Cancro da haste, Pústula bacteriana, Nematoides (várias raças)  
+        **Resultados:** 7 resultados com nome, local e produtividade  
+        **Calendário:** Mês 1 a Mês 12 para plantio  
         
-        3. **👁️ Transcrição com IA Vision**  
-           → Usa Gemini 2.0 Flash Exp  
-           → Lê TODO o texto das imagens  
-           → Captura tabelas, números, dados técnicos
+        ### ✅ **Resultado Esperado:**
+        - **CSV com 81 colunas** formatado para Google Sheets
+        - **Cada linha** representa uma cultivar para o site
+        - **Dados estruturados** automaticamente da documentação técnica
         
-        4. **📊 Extração de Dados**  
-           → Usa Gemini 1.5 Flash  
-           → Identifica cultivares  
-           → Extrai dados para 81 colunas
+        ### 📤 **Como usar:**
+        1. Carregue um documento DOCX na barra lateral
+        2. Clique em **"Processar Documento"**
+        3. Baixe o **CSV com 81 colunas**
+        4. Importe no **Google Sheets**
         
-        5. **📄 CSV para Google Sheets**  
-           → Gera arquivo pronto para importar  
-           → 81 colunas formatadas  
-           → Compatível com qualquer planilha
-        
-        ### ✅ **Resultado Final:**
-        - **CSV pronto para Google Sheets**
-        - **81 colunas organizadas**
-        - **Dados estruturados automaticamente**
-        - **Importação com 1 clique**
-        
-        **Para começar, carregue um DOCX na barra lateral!**
+        **Pronto para começar? Carregue seu primeiro documento!**
         """)
+        
+        # Exemplo de estrutura esperada
+        with st.expander("📊 Ver exemplo de saída esperada", expanded=False):
+            st.markdown("""
+            **Exemplo de uma linha no CSV final:**
+            ```
+            Cultura: Soja
+            Nome do produto: NS7524IPRO
+            Tecnologia: IPRO
+            Grupo de maturação: 7.5
+            Fertilidade: Alto
+            Estado (por extenso): Santa Catarina, Paraná
+            Ciclo: Precoce
+            PMS MÉDIO: 150G
+            Resultado 1: 106,0 sc/ha (Fazenda Planalto - Costa Rica/MS)
+            ... mais 73 colunas ...
+            ```
+            """)
 
 if __name__ == "__main__":
     main()
