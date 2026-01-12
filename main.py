@@ -21,8 +21,8 @@ if not gemini_api_key:
 
 try:
     genai.configure(api_key=gemini_api_key)
-    modelo_visao = genai.GenerativeModel("gemini-2.5-flash")
-    modelo_texto = genai.GenerativeModel("gemini-2.5-flash")
+    modelo_visao = genai.GenerativeModel("gemini-2.0-flash-exp")
+    modelo_texto = genai.GenerativeModel("gemini-1.5-flash")
 except Exception as e:
     st.error(f"Erro: {str(e)}")
     st.stop()
@@ -65,10 +65,12 @@ if 'df' not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
 if 'csv_content' not in st.session_state:
     st.session_state.csv_content = ""
-if 'tabelas_extraidas' not in st.session_state:
-    st.session_state.tabelas_extraidas = ""
+if 'paginas_processadas' not in st.session_state:
+    st.session_state.paginas_processadas = 0
+if 'total_paginas' not in st.session_state:
+    st.session_state.total_paginas = 0
 
-def extrair_paginas_docx(docx_bytes):
+def contar_paginas_docx(docx_bytes):
     try:
         with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
             tmp.write(docx_bytes)
@@ -76,65 +78,68 @@ def extrair_paginas_docx(docx_bytes):
         
         doc = docx.Document(docx_path)
         
-        paginas = []
-        pagina_atual = []
-        linha_contador = 0
+        texto_total = ""
+        for para in doc.paragraphs:
+            if para.text.strip():
+                texto_total += para.text.strip() + "\n"
         
-        for element in doc.element.body:
-            if element.tag.endswith('p'):
-                texto = ""
-                for run in element.iter():
-                    if run.text:
-                        texto += run.text
-                if texto.strip():
-                    pagina_atual.append(texto.strip())
-                    linha_contador += 1
-                    
-                    if linha_contador >= 40:
-                        paginas.append("\n".join(pagina_atual))
-                        pagina_atual = []
-                        linha_contador = 0
-            
-            elif element.tag.endswith('tbl'):
-                tabela_texto = []
-                for row in element.iter():
-                    if row.tag.endswith('tr'):
-                        celulas = []
-                        for cell in row.iter():
-                            if cell.tag.endswith('tc'):
-                                cell_text = ""
-                                for txt in cell.iter():
-                                    if txt.text:
-                                        cell_text += txt.text
-                                if cell_text.strip():
-                                    celulas.append(cell_text.strip())
-                        if celulas:
-                            tabela_texto.append(" | ".join(celulas))
-                
-                if tabela_texto:
-                    if len("\n".join(tabela_texto)) > 2000:
-                        for linha_tabela in tabela_texto:
-                            pagina_atual.append(linha_tabela)
-                            linha_contador += 1
-                            
-                            if linha_contador >= 40:
-                                paginas.append("\n".join(pagina_atual))
-                                pagina_atual = []
-                                linha_contador = 0
-                    else:
-                        for linha_tabela in tabela_texto:
-                            pagina_atual.append(linha_tabela)
-                            linha_contador += 1
+        for table in doc.tables:
+            for row in table.rows:
+                cells_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells_text:
+                    texto_total += " | ".join(cells_text) + "\n"
         
-        if pagina_atual:
-            paginas.append("\n".join(pagina_atual))
+        total_caracteres = len(texto_total)
+        paginas_estimadas = max(1, total_caracteres // 2500)
+        
+        os.unlink(docx_path)
+        return paginas_estimadas
+        
+    except Exception as e:
+        return 1
+
+def extrair_conteudo_por_pagina(docx_bytes, total_paginas):
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
+            tmp.write(docx_bytes)
+            docx_path = tmp.name
+        
+        doc = docx.Document(docx_path)
+        
+        conteudo_completo = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                conteudo_completo.append(para.text.strip())
+        
+        for table in doc.tables:
+            tabela_texto = []
+            for row in table.rows:
+                linha = []
+                for cell in row.cells:
+                    if cell.text.strip():
+                        linha.append(cell.text.strip())
+                if linha:
+                    tabela_texto.append(" | ".join(linha))
+            if tabela_texto:
+                conteudo_completo.append("[TABELA]")
+                conteudo_completo.extend(tabela_texto)
         
         os.unlink(docx_path)
         
-        return paginas
+        paginas = []
+        if total_paginas <= 1:
+            paginas.append("\n".join(conteudo_completo))
+        else:
+            linhas_por_pagina = max(1, len(conteudo_completo) // total_paginas)
+            for i in range(0, len(conteudo_completo), linhas_por_pagina):
+                paginas.append("\n".join(conteudo_completo[i:i+linhas_por_pagina]))
+                if len(paginas) >= total_paginas:
+                    break
+        
+        return paginas[:total_paginas]
         
     except Exception as e:
-        st.error(f"Erro ao extrair páginas: {str(e)}")
+        st.error(f"Erro: {str(e)}")
         return []
 
 def criar_imagem_pagina(texto_pagina, num_pagina, total_paginas):
@@ -149,10 +154,11 @@ def criar_imagem_pagina(texto_pagina, num_pagina, total_paginas):
     y = 100
     x = 100
     
-    for linha in texto_pagina.split('\n'):
+    linhas = texto_pagina.split('\n')
+    for linha in linhas:
         if y < 1900:
-            if len(linha) > 150:
-                partes = [linha[i:i+150] for i in range(0, len(linha), 150)]
+            if len(linha) > 120:
+                partes = [linha[i:i+120] for i in range(0, len(linha), 120)]
                 for parte in partes:
                     if y < 1900:
                         draw.text((x, y), parte, fill='black', font=font)
@@ -161,34 +167,28 @@ def criar_imagem_pagina(texto_pagina, num_pagina, total_paginas):
                 draw.text((x, y), linha, fill='black', font=font)
                 y += 20
     
-    draw.text((1200, 1950), f"Pág {num_pagina}/{total_paginas}", fill='gray', font=font)
-    
+    draw.text((1250, 1950), f"Pág {num_pagina}/{total_paginas}", fill='gray', font=font)
     return img
 
-def extrair_tabelas_imagem(imagem):
+def extrair_tabelas_da_imagem(imagem):
     try:
         img_bytes = io.BytesIO()
         imagem.save(img_bytes, format='PNG')
         img_bytes = img_bytes.getvalue()
         
-        prompt = """ANALISE ESTA IMAGEM E EXTRAIA TODAS AS TABELAS QUE CONTENHAM:
-
-        TIPOS DE TABELAS A EXTRAIR:
-        1. TABELAS COM REC (números como 202, 203, 204)
-        2. TABELAS COM UF (RS, SC, PR, SP, MS, MG, GO)
-        3. TABELAS COM REGIÃO (Sul, Sudeste, Centro-Oeste)
-        4. TABELAS COM MESES (Janeiro, Fevereiro, Março, etc.)
-        5. TABELAS COM PERÍODOS (1-10, 11-20, 21-31)
-        6. TABELAS COM VALORES (180-260, NR, etc.)
-        7. TABELAS COM PRODUTOS (NK401VIP3, NS7524IPRO, etc.)
-
-        FORMATE AS TABELAS COMO:
+        prompt = """EXTRAIA TODAS AS TABELAS desta imagem. FOCAR EM:
+        - Tabelas com REC (202, 203, 204...)
+        - Tabelas com UF (RS, SC, PR, SP, MS, MG, GO...)
+        - Tabelas com Região (Sul, Sudeste...)
+        - Tabelas com Meses (Janeiro, Fevereiro...)
+        - Tabelas com períodos (1-10, 11-20, 21-31)
+        - Tabelas com valores (180-260, NR...)
+        - Tabelas com nomes de produtos
+        
+        Retorne as tabelas no formato:
         | Coluna1 | Coluna2 | Coluna3 |
         |---------|---------|---------|
         | Valor1  | Valor2  | Valor3  |
-
-        Extraia TUDO que parecer uma tabela com essas informações.
-        Inclua TODAS as linhas e colunas.
         """
         
         response = modelo_visao.generate_content([
@@ -203,45 +203,29 @@ def extrair_tabelas_imagem(imagem):
 
 def processar_todas_tabelas(texto_tabelas):
     prompt = f"""
-    ANALISE ESTAS TABELAS EXTRAÍDAS DE UM DOCUMENTO DE CULTIVARES:
+    ANALISE ESTAS TABELAS EXTRAÍDAS DE IMAGENS DE DOCUMENTO:
 
     TABELAS:
-    {texto_tabelas}
+    {texto_tabelas[:200000]}
 
-    SUA TAREFA: Extrair dados para preencher um CSV com {len(COLUNAS_EXATAS)} colunas.
-
-    COLUNAS A PREENCHER:
+    EXTRAIA DADOS PARA ESTAS {len(COLUNAS_EXATAS)} COLUNAS:
     {', '.join(COLUNAS_EXATAS)}
 
-    REGRAS IMPORTANTES:
-    1. REC, UF, Região DEVEM vir das tabelas acima
-    2. Dados temporais (Janeiro 1-10 até Dezembro 21-31) DEVEM vir das tabelas acima
-    3. Cada combinação Produto + REC = uma linha separada
-    4. Se um produto tem REC 202 e REC 203 = 2 linhas
-    5. Use "NR" para dados não encontrados nas tabelas
-    6. Para UF múltiplo: "RS, SC, PR"
-    7. Para valores temporais: "180-260" ou "NR"
+    REGRAS:
+    1. REC, UF, Região DEVEM vir das tabelas
+    2. Dados temporais (Janeiro 1-10 até Dezembro 21-31) DEVEM vir das tabelas
+    3. Cada Produto+REC = linha separada
+    4. Use "NR" para dados não encontrados
+    5. UF múltiplo: "RS, SC, PR"
+    6. Valores temporais: "180-260" ou "NR"
 
-    PROCURE NAS TABELAS POR:
-    - Tabelas com cabeçalhos: REC, UF, Região
-    - Tabelas com meses e períodos: Janeiro 1-10, Janeiro 11-20, etc.
-    - Tabelas com nomes de produtos: NK401VIP3, NS7524IPRO
-    - Tabelas com características: Cultura, Tecnologia, Ciclo
+    PROCURE POR:
+    - | REC | UF | Região |
+    - | Mês | 1-10 | 11-20 | 21-31 |
+    - | Produto | REC | UF | Região |
+    - Tabelas com meses e períodos
 
-    EXEMPLOS DE TABELAS A PROCURAR:
-    1. | REC | UF | Região |
-       | 202 | RS,SC | Sul |
-       | 203 | SP,MS | Sudeste |
-
-    2. | Mês | 1-10 | 11-20 | 21-31 |
-       | Janeiro | 180-260 | NR | 180-260 |
-       | Fevereiro | NR | 180-260 | 180-260 |
-
-    3. | Produto | REC | UF | Região |
-       | NK401VIP3 | 202 | RS,SC | Sul |
-       | NK401VIP3 | 203 | SP,MS | Sudeste |
-
-    Retorne APENAS um array JSON onde cada objeto tem {len(COLUNAS_EXATAS)} propriedades.
+    Retorne JSON array com {len(COLUNAS_EXATAS)} propriedades por objeto.
     """
     
     try:
@@ -281,7 +265,7 @@ def processar_todas_tabelas(texto_tabelas):
             return []
         
     except Exception as e:
-        st.error(f"Erro ao processar tabelas: {str(e)}")
+        st.error(f"Erro: {str(e)}")
         return []
 
 def criar_dataframe(dados):
@@ -336,32 +320,44 @@ def gerar_csv(df):
 uploaded_file = st.file_uploader("Carregue DOCX:", type=["docx"])
 
 if uploaded_file:
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("Processar Documento"):
-            st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
-            st.session_state.csv_content = ""
-            st.session_state.tabelas_extraidas = ""
+    if st.button("Processar Documento"):
+        st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
+        st.session_state.csv_content = ""
+        
+        with st.spinner("Analisando documento..."):
+            st.session_state.total_paginas = contar_paginas_docx(uploaded_file.getvalue())
+        
+        st.write(f"📄 Documento identificado: {st.session_state.total_paginas} página(s)")
+        
+        if st.session_state.total_paginas > 0:
+            todas_tabelas = []
+            progress_bar = st.progress(0)
             
-            try:
-                paginas = extrair_paginas_docx(uploaded_file.getvalue())
+            for pagina_num in range(st.session_state.total_paginas):
+                progresso = (pagina_num + 1) / st.session_state.total_paginas
+                progress_bar.progress(progresso)
                 
-                if not paginas:
-                    st.error("Falha ao extrair páginas")
+                st.write(f"📖 Processando página {pagina_num + 1}/{st.session_state.total_paginas}")
                 
-                todas_tabelas = []
+                try:
+                    paginas = extrair_conteudo_por_pagina(uploaded_file.getvalue(), st.session_state.total_paginas)
+                    if pagina_num < len(paginas):
+                        imagem = criar_imagem_pagina(paginas[pagina_num], pagina_num + 1, st.session_state.total_paginas)
+                        tabelas = extrair_tabelas_da_imagem(imagem)
+                        
+                        if tabelas and "ERRO" not in tabelas:
+                            todas_tabelas.append(f"\n--- Página {pagina_num + 1} ---\n{tabelas}")
                 
-                for i, texto_pagina in enumerate(paginas):
-                    imagem = criar_imagem_pagina(texto_pagina, i+1, len(paginas))
-                    tabelas = extrair_tabelas_imagem(imagem)
-                    if tabelas and "ERRO" not in tabelas:
-                        todas_tabelas.append(f"\n--- Página {i+1} ---\n{tabelas}")
+                except Exception as e:
+                    st.error(f"Erro na página {pagina_num + 1}: {str(e)}")
+            
+            progress_bar.empty()
+            
+            if todas_tabelas:
+                texto_tabelas = "\n".join(todas_tabelas)
+                st.session_state.paginas_processadas = len(todas_tabelas)
                 
-                if todas_tabelas:
-                    texto_tabelas = "\n".join(todas_tabelas)
-                    st.session_state.tabelas_extraidas = texto_tabelas
-                    
+                with st.spinner("Processando tabelas extraídas..."):
                     dados = processar_todas_tabelas(texto_tabelas)
                     
                     if dados:
@@ -371,18 +367,18 @@ if uploaded_file:
                         if not df.empty:
                             csv_content = gerar_csv(df)
                             st.session_state.csv_content = csv_content
-                else:
-                    st.warning("Nenhuma tabela encontrada")
-            
-            except Exception as e:
-                st.error(f"Erro: {str(e)}")
+                            
+                            st.write(f"✅ {st.session_state.paginas_processadas}/{st.session_state.total_paginas} páginas processadas")
+                            st.write(f"📊 {len(df)} linha(s) extraída(s)")
+            else:
+                st.warning("Nenhuma tabela encontrada nas imagens")
     
-    with col2:
-        if st.button("Limpar"):
-            st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
-            st.session_state.csv_content = ""
-            st.session_state.tabelas_extraidas = ""
-            st.rerun()
+    if st.button("Limpar"):
+        st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
+        st.session_state.csv_content = ""
+        st.session_state.paginas_processadas = 0
+        st.session_state.total_paginas = 0
+        st.rerun()
     
     df = st.session_state.df
     
