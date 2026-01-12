@@ -666,7 +666,7 @@ def main():
         ```
         
         **Carregue um DOCX com tabelas temporais detalhadas para começar.**
-        """.format(len(COLUNAS_EXATAS)=len(COLUNAS_EXATAS)))
+        """)
 
 if __name__ == "__main__":
     main()
