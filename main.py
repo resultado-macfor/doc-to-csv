@@ -23,21 +23,21 @@ if not gemini_api_key:
 
 try:
     genai.configure(api_key=gemini_api_key)
-    modelo_visao = genai.GenerativeModel("gemini-1.5-pro-vision")
-    modelo_texto = genai.GenerativeModel("gemini-1.5-flash")
+    modelo_visao = genai.GenerativeModel("gemini-2.5-pro")
+    modelo_texto = genai.GenerativeModel("gemini-2.5-flash")
 except Exception as e:
     st.error(f"Erro ao configurar Gemini: {str(e)}")
     st.stop()
 
-# COLUNAS EXATAS conforme o template
+# COLUNAS EXATAS conforme o template - corrigindo duplicatas
 COLUNAS_EXATAS = [
     "Cultura", "Nome do produto", "NOME TÉCNICO/ REG", "Descritivo para SEO", 
     "Fertilidade", "Grupo de maturação", "Lançamento", "Slogan", "Tecnologia", 
     "Região (por extenso)", "Estado (por extenso)", "Ciclo", "Finalidade", 
-    "URL da imagem do mapa", "Número do ícone", "Titulo icone 1", "Descrição Icone 1", 
-    "Número do ícone", "Titulo icone 2", "Descrição Icone 2", "Número do ícone", 
-    "Titulo icone 3", "Descrição Icone 3", "Número do ícone", "Título icone 4", 
-    "Descrição Icone 4", "Número do ícone", "Título icone 5", "Descrição Icone 5", 
+    "URL da imagem do mapa", "Número do ícone 1", "Titulo icone 1", "Descrição Icone 1", 
+    "Número do ícone 2", "Titulo icone 2", "Descrição Icone 2", "Número do ícone 3", 
+    "Titulo icone 3", "Descrição Icone 3", "Número do ícone 4", "Título icone 4", 
+    "Descrição Icone 4", "Número do ícone 5", "Título icone 5", "Descrição Icone 5", 
     "Exigência à fertilidade", "Grupo de maturidade", "PMS MÉDIO", "Tipo de crescimento", 
     "Cor da flor", "Cor da pubescência", "Cor do hilo", "Cancro da haste", 
     "Pústula bacteriana ", "Nematoide das galhas - M. javanica", 
@@ -52,6 +52,11 @@ COLUNAS_EXATAS = [
     "Região", "Mês 1", "Mês 2", "Mês 3", "Mês 4", "Mês 5", "Mês 6", "Mês 7", 
     "Mês 8", "Mês 9", "Mês 10", "Mês 11", "Mês 12"
 ]
+
+# Verificar se há duplicatas
+if len(COLUNAS_EXATAS) != len(set(COLUNAS_EXATAS)):
+    duplicatas = [item for item in COLUNAS_EXATAS if COLUNAS_EXATAS.count(item) > 1]
+    st.warning(f"Colunas duplicadas encontradas: {set(duplicatas)}")
 
 # Session state
 if 'df' not in st.session_state:
@@ -215,7 +220,7 @@ def extrair_dados_para_csv(texto_transcrito):
         st.error(f"Erro na extração: {str(e)}")
         return []
 
-# Função 4: Criar DataFrame
+# Função 4: Criar DataFrame com colunas únicas
 def criar_dataframe(dados):
     if not dados or not isinstance(dados, list):
         return pd.DataFrame(columns=COLUNAS_EXATAS)
@@ -225,15 +230,32 @@ def criar_dataframe(dados):
         if isinstance(item, dict):
             linha = {}
             for coluna in COLUNAS_EXATAS:
-                valor = item.get(coluna, "NR")
+                # Procurar valor usando diferentes variações do nome da coluna
+                valor = "NR"
+                for chave, val in item.items():
+                    if chave.strip() == coluna or coluna in chave.strip():
+                        valor = val
+                        break
+                
                 if isinstance(valor, str):
                     linha[coluna] = valor.strip()
                 else:
                     linha[coluna] = str(valor).strip()
-            linhas.append(linha)
+            
+            # Adicionar apenas se tiver dados
+            if any(v != "NR" for v in linha.values()):
+                linhas.append(linha)
     
     if linhas:
-        return pd.DataFrame(linhas, columns=COLUNAS_EXATAS)
+        df = pd.DataFrame(linhas)
+        # Garantir que temos todas as colunas, mesmo se vazias
+        for col in COLUNAS_EXATAS:
+            if col not in df.columns:
+                df[col] = "NR"
+        
+        # Ordenar colunas
+        df = df[COLUNAS_EXATAS]
+        return df
     else:
         return pd.DataFrame(columns=COLUNAS_EXATAS)
 
@@ -251,7 +273,7 @@ def gerar_csv_para_gsheets(df):
         linha = []
         for col in COLUNAS_EXATAS:
             valor = str(row.get(col, "NR")).strip()
-            if valor in ["", "nan", "None", "null"]:
+            if valor in ["", "nan", "None", "null", "NaN"]:
                 valor = "NR"
             linha.append(valor)
         writer.writerow(linha)
@@ -282,6 +304,7 @@ def main():
                     if not imagens:
                         st.error("Falha na conversão do DOCX")
                         return
+                    st.success(f"✅ Convertido em {len(imagens)} imagem(ns)")
                 
                 # PASSO 2: Transcrever imagens
                 with st.spinner("Transcrevendo imagens com IA Vision..."):
@@ -290,6 +313,7 @@ def main():
                         st.error("Falha na transcrição")
                         return
                     st.session_state.texto_transcrito = texto
+                    st.success(f"✅ Transcrição concluída ({len(texto)} caracteres)")
                 
                 # PASSO 3: Extrair dados
                 with st.spinner("Extraindo dados para 81 colunas..."):
@@ -298,11 +322,15 @@ def main():
                         df = criar_dataframe(dados)
                         st.session_state.df = df
                         
-                        # Gerar CSV
-                        csv_content = gerar_csv_para_gsheets(df)
-                        st.session_state.csv_content = csv_content
+                        if not df.empty:
+                            # Gerar CSV
+                            csv_content = gerar_csv_para_gsheets(df)
+                            st.session_state.csv_content = csv_content
+                            st.success(f"✅ {len(df)} cultivar(s) extraída(s)")
+                        else:
+                            st.warning("Nenhuma cultivar identificada")
                     else:
-                        st.warning("Nenhuma cultivar identificada")
+                        st.warning("Nenhum dado extraído")
                 
             except Exception as e:
                 st.error(f"Erro no processamento: {str(e)}")
@@ -319,10 +347,18 @@ def main():
         if not df.empty:
             st.write(f"**{len(df)} cultivar(s) extraída(s)**")
             
-            if st.checkbox("Mostrar texto transcrito"):
-                st.text_area("Texto transcrito:", st.session_state.texto_transcrito[:2000], height=300)
+            # Verificar duplicatas nas colunas geradas
+            colunas_geradas = list(df.columns)
+            if len(colunas_geradas) != len(set(colunas_geradas)):
+                st.warning(f"Aviso: Há {len(colunas_geradas) - len(set(colunas_geradas))} coluna(s) duplicada(s)")
             
-            st.dataframe(df, use_container_width=True, height=400)
+            # Mostrar texto transcrito
+            with st.expander("Ver texto transcrito"):
+                st.text_area("Texto:", st.session_state.texto_transcrito[:2000], height=300)
+            
+            # Mostrar DataFrame com verificação
+            st.write("**Dados extraídos:**")
+            st.dataframe(df, use_container_width=True)
             
             # Download
             nome_base = uploaded_file.name.split('.')[0]
@@ -333,7 +369,8 @@ def main():
                     label="Baixar CSV",
                     data=st.session_state.csv_content.encode('utf-8'),
                     file_name=f"cultivares_{nome_base}_{timestamp}.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    type="primary"
                 )
         
         elif st.session_state.df is not None and df.empty and st.session_state.texto_transcrito:
