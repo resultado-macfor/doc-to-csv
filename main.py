@@ -10,8 +10,6 @@ import json
 import re
 from PIL import Image, ImageDraw, ImageFont
 import fitz  # PyMuPDF
-import pdf2image
-from pdf2image import convert_from_bytes
 import numpy as np
 
 # Configuração
@@ -36,7 +34,7 @@ except Exception as e:
 meses_detalhados = []
 for mes in ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", 
             "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]:
-    for num in ["1", "2", "3"]:  # Janeiro 1, Janeiro 2, Janeiro 3, etc.
+    for num in ["1", "2", "3"]:
         meses_detalhados.append(f"{mes} {num}")
 
 # COLUNAS EXATAS conforme o template
@@ -60,7 +58,7 @@ COLUNAS_EXATAS = [
     "Resultado 5", "Resultado 6 - Nome", "Resultado 6 - Local", "Resultado 6", 
     "Resultado 7 - Nome", "Resultado 7 - Local", "Resultado 7", "REC", "UF", 
     "Região"
-] + meses_detalhados  # Adicionar os 36 meses detalhados (12 meses × 3)
+] + meses_detalhados
 
 # Session state
 if 'df' not in st.session_state:
@@ -71,36 +69,31 @@ if 'texto_transcrito' not in st.session_state:
     st.session_state.texto_transcrito = ""
 if 'imagens_paginas' not in st.session_state:
     st.session_state.imagens_paginas = []
+if 'tipo_cultura' not in st.session_state:
+    st.session_state.tipo_cultura = "Milho"
 
-# Função 1: Converter PDF para imagens (uma imagem por página)
+# Função para converter PDF para imagens
 def pdf_para_imagens(pdf_bytes):
     try:
         st.info("Convertendo PDF para imagens...")
+        imagens = []
         
-        # Converter PDF para lista de imagens (uma por página)
-        imagens = convert_from_bytes(
-            pdf_bytes,
-            dpi=300,
-            fmt='PNG',
-            thread_count=4,
-            poppler_path=None
-        )
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_paginas = len(doc)
         
-        st.success(f"✅ PDF convertido em {len(imagens)} página(s)")
-        return imagens
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-    except Exception as e:
-        st.error(f"Erro ao converter PDF para imagens: {str(e)}")
-        st.info("Tentando método alternativo...")
-        
-        try:
-            imagens = []
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page_num in range(total_paginas):
+            progresso = (page_num + 1) / total_paginas
+            status_text.text(f"Convertendo página {page_num + 1} de {total_paginas}...")
+            progress_bar.progress(progresso)
             
-            for page_num in range(len(doc)):
+            try:
                 page = doc.load_page(page_num)
-                mat = fitz.Matrix(300/72, 300/72)
-                pix = page.get_pixmap(matrix=mat)
+                zoom = 4
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
                 img_data = pix.tobytes("ppm")
                 img = Image.open(io.BytesIO(img_data))
                 
@@ -108,17 +101,28 @@ def pdf_para_imagens(pdf_bytes):
                     img = img.convert('RGB')
                 
                 imagens.append(img)
-            
-            doc.close()
-            st.success(f"✅ PDF convertido em {len(imagens)} página(s) - Método alternativo")
+                
+            except Exception as e:
+                st.warning(f"Erro na página {page_num + 1}: {str(e)[:100]}")
+                continue
+        
+        doc.close()
+        progress_bar.empty()
+        status_text.empty()
+        
+        if imagens:
+            st.success(f"✅ PDF convertido em {len(imagens)} página(s)")
             return imagens
-            
-        except Exception as e2:
-            st.error(f"Erro no método alternativo: {str(e2)}")
+        else:
+            st.error("❌ Não foi possível converter nenhuma página")
             return []
+            
+    except Exception as e:
+        st.error(f"Erro ao converter PDF: {str(e)}")
+        return []
 
-# Função 2: Processar imagens em lote para transcrever
-def processar_imagens_em_lote(imagens, batch_size=10):
+# Função para processar imagens em lote
+def processar_imagens_em_lote(imagens, batch_size=3):
     if not imagens:
         return ""
     
@@ -140,26 +144,30 @@ def processar_imagens_em_lote(imagens, batch_size=10):
             progress_bar.progress(progresso, text=f"Transcrevendo página {pagina_num}/{total_paginas}")
             
             try:
+                # Redimensionar se necessário
+                largura_max = 1600
+                if imagem.width > largura_max:
+                    proporcao = largura_max / imagem.width
+                    nova_altura = int(imagem.height * proporcao)
+                    imagem = imagem.resize((largura_max, nova_altura), Image.Resampling.LANCZOS)
+                
                 img_bytes = io.BytesIO()
-                imagem.save(img_bytes, format='PNG', optimize=True)
+                imagem.save(img_bytes, format='PNG', optimize=True, quality=95)
                 img_bytes = img_bytes.getvalue()
                 
                 prompt = """TRANSCREVA TODO o texto desta página EXATAMENTE como aparece.
                 
-                INSTRUÇÕES IMPORTANTES:
-                1. Transcreva TODO o texto visível
-                2. Mantenha a formatação original (linhas, espaços)
-                3. Inclua tabelas, números, datas
-                4. Especial atenção para:
-                   - Nomes de cultivares
-                   - Números de REC/Registro
-                   - Características técnicas
-                   - Regiões e estados
-                   - Datas e períodos
-                   - Dados de produtividade
-                   - Valores em tabelas de meses
-                5. Se houver texto em colunas, mantenha a ordem
-                6. Se houver tabelas, transcreva linha por linha
+                INSTRUÇÕES CRÍTICAS:
+                1. Transcreva TODO o texto visível EXATAMENTE
+                2. Mantenha a formatação original de tabelas
+                3. Para tabelas de meses, transcreva LINHA POR LINHA com os valores
+                4. Inclua TODOS os números e valores
+                5. Se houver "REC", "Registro" ou números de registro, transcreva
+                
+                Formato importante para tabelas:
+                - Mantenha as colunas separadas por |
+                - Mantenha os valores como estão
+                - Não resuma, não interprete
                 
                 Retorne APENAS o texto transcrito."""
                 
@@ -172,7 +180,7 @@ def processar_imagens_em_lote(imagens, batch_size=10):
                 texto_completo += f"\n\n--- PÁGINA {pagina_num} ---\n{texto_pagina}\n"
                 
                 import time
-                time.sleep(0.5)
+                time.sleep(1)
                 
             except Exception as e:
                 texto_completo += f"\n\n--- ERRO PÁGINA {pagina_num}: {str(e)[:100]} ---\n"
@@ -180,129 +188,169 @@ def processar_imagens_em_lote(imagens, batch_size=10):
         
         import time
         if batch_end < total_paginas:
-            time.sleep(2)
+            time.sleep(3)
     
     progress_bar.empty()
     status_text.empty()
     
     return texto_completo
 
-# Função 3: Extrair dados do texto transcrito (ATUALIZADA)
-def extrair_dados_para_csv(texto_transcrito):
-    prompt = f"""
-    ANALISE O TEXTO TRANSCRITO DE UM PDF SOBRE CULTIVARES AGRÍCOLAS:
+# Função para criar prompt baseado no tipo de cultura
+def criar_prompt_para_cultura(texto_transcrito, tipo_cultura):
+    """Cria prompt específico para Milho ou Soja"""
+    
+    if tipo_cultura == "Soja":
+        prompt_rec = """
+        G. REC, UF, REGIÃO (IMPORTANTE! - APENAS PARA SOJA):
+           - "REC": Procure por números de registro como: 201, 300, 400, etc.
+           - Geralmente são números de 2-5 dígitos
+           - Se uma cultivar tiver MAIS DE UM REC, crie uma LINHA SEPARADA para cada REC
+           - Se não encontrar REC, use "NR"
+           - "UF": Estados (ex: "TO,PA,MA,PI", "SP,MG,MS,GO,DF,MT")
+           - "Região": Região (ex: "Norte", "Centro-Oeste,Sudeste")
+        """
+    else:  # Milho
+        prompt_rec = """
+        G. REC, UF, REGIÃO (PARA MILHO - SEM REC):
+           - "REC": SEMPRE "NR" (Milho não tem REC)
+           - "UF": Estados (ex: "RS,SC,PR,SP", "PR,SP,MS,MG,GO,DF,MT,TO,PA,MA,PI,RO")
+           - "Região": Região (ex: "Sul", "Centro-Oeste,Norte,Sudeste")
+        """
+    
+    # Colunas específicas para doenças
+    if tipo_cultura == "Soja":
+        doencas_prompt = """
+        D. RESISTÊNCIAS A DOENÇAS (PARA SOJA):
+           - "Cancro da haste": Procure por "Cancro" nas tabelas de resistência
+           - "Pústula bacteriana": Procure por "Pústula" 
+           - "Nematoide das galhas - M. javanica": Procure por "M. javanica"
+           - "Nematóide de Cisto (Raça 3)": Procure por "Raça 3"
+           - "Nematóide de Cisto (Raça 9)": Procure por "Raça 9"
+           - "Nematóide de Cisto (Raça 10)": Procure por "Raça 10"
+           - "Nematóide de Cisto (Raça 14)": Procure por "Raça 14"
+           - "Fitóftora (Raça 1)": Procure por "Fitóftora"
+           - Use R (Resistente), MR (Moderadamente Resistente), S (Suscetível)
+        """
+    else:  # Milho
+        doencas_prompt = """
+        D. RESISTÊNCIAS A DOENÇAS (PARA MILHO - NÃO PREENCHER COLUNAS DE SOJA):
+           - "Cancro da haste": "NR"
+           - "Pústula bacteriana": "NR" 
+           - "Nematoide das galhas - M. javanica": "NR"
+           - "Nematóide de Cisto (Raça 3)": "NR"
+           - "Nematóide de Cisto (Raça 9)": "NR"
+           - "Nematóide de Cisto (Raça 10)": "NR"
+           - "Nematóide de Cisto (Raça 14)": "NR"
+           - "Fitóftora (Raça 1)": "NR"
+           - As doenças do milho no texto são específicas para milho
+        """
+    
+    prompt_base = f"""
+    ANALISE O TEXTO TRANSCRITO DE UM PDF SOBRE CULTIVARES DE {tipo_cultura.upper()}:
 
     TEXTO TRANSCRITO:
     {texto_transcrito}
 
-    SUA TAREFA: Extrair informações sobre cultivares e preencher estas {len(COLUNAS_EXATAS)} colunas:
+    SUA TAREFA: Analisar este texto e extrair informações para preencher um CSV com estas colunas:
 
     {', '.join(COLUNAS_EXATAS)}
 
-    INSTRUÇÕES DETALHADAS:
+    INSTRUÇÕES ESPECÍFICAS PARA {tipo_cultura.upper()}:
 
-    1. IDENTIFICAÇÃO DE CULTIVARES:
-       - Procure por nomes de cultivares (ex: "BRS 8380", "SYN 136", "DM 595")
-       - Cada cultivar única deve ter uma linha no CSV
-       - Se houver múltiplas cultivares no mesmo texto, crie uma entrada para cada
+    1. PRIMEIRO: Identifique todas as CULTIVARES únicas no texto.
+       - Exemplos: "NS22PRO4", "NS66VIP3" (para milho)
+       - Cada cultivar deve ser uma entrada separada
 
-    2. FOCO NO CAMPO "REC" (CRÍTICO):
-       - Procure por números de REC como: 201, 300, 400, etc.
-       - Geralmente são números de 2-5 dígitos
-       - Se uma cultivar tiver MAIS DE UM REC, crie uma LINHA SEPARADA para cada REC
-       - Se não encontrar REC, use "NR"
+    2. INFORMAÇÕES BÁSICAS:
+       - "Cultura": "{tipo_cultura}" (definido pelo usuário)
+       - "Nome do produto": Nome da cultivar
+       - "NOME TÉCNICO/ REG": Deixe como "NR"
+       - "Descritivo para SEO": Descrição curta do produto
+       - "Fertilidade": "NR"
+       - "Grupo de maturação": "Hiper Precoce", "Precoce", etc.
+       - "Lançamento": "lançamento" (se aparecer no texto)
+       - "Slogan": Frase de marketing
+       - "Tecnologia": "NR"
+       - "Região (por extenso)": Regiões do mapa
+       - "Estado (por extenso)": Estados do mapa
+       - "Ciclo": Igual ao grupo de maturação
+       - "Finalidade": "Grãos"
+       - "URL da imagem do mapa": "NR"
 
-    3. PARA OS MESES (36 colunas detalhadas):
-       - Formato: "Janeiro 1", "Janeiro 2", "Janeiro 3", "Fevereiro 1", ..., "Dezembro 3"
-       - Preencha com os VALORES EXATOS que aparecem nas tabelas
-       - Exemplos: "180-260", "90-120", "sc/ha", "kg/ha", números, faixas
-       - Deixe em branco ("") se a informação não existir para aquele período
-       - NÃO use "X", use os valores reais da tabela
+    3. ÍCONES:
+       - Extraia os URLs e títulos dos ícones quando aparecerem
+       - Se não houver ícone, use "NR"
 
-    4. PARA OUTROS CAMPOS IMPORTANTES:
-       - "Cultura": Soja, Milho, Feijão, Trigo, etc.
-       - "Nome do produto": Nome comercial
-       - "Região (por extenso)": Sul, Sudeste, Centro-Oeste, Nordeste, Norte
-       - "Estado (por extenso)": Rio Grande do Sul, São Paulo, Mato Grosso, etc.
-       - "Ciclo": Precoce, Médio, Tardio
-       - "Lançamento": Ano (ex: 2020, 2023)
-       - "PMS MÉDIO": Peso de mil sementes (ex: "150-160 g")
-       - Resistências: R (Resistente), MR (Moderadamente Resistente), S (Suscetível)
-       - Produtividade: Mantenha formato "XX,XX sc/ha" ou "kg/ha"
+    4. CARACTERÍSTICAS TÉCNICAS:
+       - "Exigência à fertilidade": "Alta", "Médio e alto", etc.
+       - "Grupo de maturidade": Igual ao ciclo
+       - "PMS MÉDIO": Valor como "385g", "390-400g", "SI", etc.
+       - "Tipo de crescimento": "NR"
+       - "Cor da flor": "NR" (para milho), para soja procure por cor da flor
+       - "Cor da pubescência": "NR" (para soja)
+       - "Cor do hilo": "NR" (para soja)
+       - "Cor": "Amarelo", "Amarelo Alaranjado", etc. (do texto)
+       - "Textura grãos": "Dentado", "Duro", "Semi duro", etc.
+       - "Tolerância a glifosato": "Tolerante", "Não tolerante"
+       - "Tolerância a glufosinato": "Tolerante", "Não tolerante"
 
-    5. REGRAS GERAIS:
+    {doencas_prompt}
+
+    5. RECOMENDAÇÕES:
+       - "Recomendações": Texto sobre "Pode haver variação no ciclo..."
+
+    6. RESULTADOS:
+       - "Resultado 1 - Nome" até "Resultado 7 - Local": "NR" (não há no texto)
+
+    {prompt_rec}
+
+    7. TABELAS DE MESES:
+       Para CADA LINHA da tabela que tem valores (como "60-65", "55-60", "75-82"):
+       - Crie UMA LINHA NO CSV para cada combinação única
+       - Para MILHO: cada linha tem seus próprios valores de meses
+       - Para SOJA: cada REC tem seus próprios valores de meses
+       - Preencha os meses com os valores EXATOS da tabela
+       - Deixe as colunas de meses sem valor como ""
+
+    8. REGRAS GERAIS:
        - Use "NR" para informações não encontradas
-       - Mantenha os nomes das colunas EXATAMENTE como estão acima
-       - Para campos numéricos, mantenha unidades quando aplicável
-       - Para múltiplos valores, separe com vírgula
-       - Para campos de texto, mantenha o texto original
+       - Mantenha valores EXATOS do texto
+       - Não invente informações
+       - Para múltiplas cultivares, crie uma entrada para cada
 
-    6. FORMATO DE SAÍDA:
-       - Retorne APENAS um array JSON válido
-       - Cada objeto representa uma cultivar + REC (uma linha no CSV)
-       - Cada objeto deve ter {len(COLUNAS_EXATAS)} propriedades
-       - Nomes das propriedades DEVEM ser exatos
-       - Inclua TODAS as propriedades, mesmo que vazias
-
-    EXEMPLO DE SAÍDA:
-    [
-      {{
-        "Cultura": "Soja",
-        "Nome do produto": "BRS 8380",
-        "NOME TÉCNICO/ REG": "BRS 8380 IPRO",
-        "REC": "201",
-        "Região (por extenso)": "Sul,Sudeste",
-        "Estado (por extenso)": "Rio Grande do Sul,Paraná",
-        "Ciclo": "Médio",
-        "Lançamento": "2020",
-        "Janeiro 1": "180-260",
-        "Janeiro 2": "200-280",
-        "Janeiro 3": "",
-        "Fevereiro 1": "190-270",
-        "Fevereiro 2": "",
-        "Fevereiro 3": "85,50 sc/ha",
-        ... // outras colunas de meses com valores reais
-        ... // todas as outras colunas
-      }},
-      {{
-        "Cultura": "Soja",
-        "Nome do produto": "BRS 8380",
-        "NOME TÉCNICO/ REG": "BRS 8380 IPRO",
-        "REC": "300",
-        "Região (por extenso)": "Centro-Oeste",
-        "Estado (por extenso)": "Mato Grosso,Goiás",
-        "Ciclo": "Médio",
-        "Lançamento": "2020",
-        "Janeiro 1": "",
-        "Janeiro 2": "150-230",
-        "Janeiro 3": "170-250",
-        "Fevereiro 1": "",
-        "Fevereiro 2": "160-240",
-        "Fevereiro 3": "",
-        ... // outras colunas de meses com valores reais
-        ... // todas as outras colunas
-      }}
-    ]
+    9. FORMATO DE SAÍDA:
+       Retorne APENAS um array JSON válido com TODAS as {len(COLUNAS_EXATAS)} propriedades.
     """
     
+    return prompt_base
+
+# Função para extrair dados
+def extrair_dados_para_csv(texto_transcrito, tipo_cultura):
+    # Criar prompt específico para o tipo de cultura
+    prompt = criar_prompt_para_cultura(texto_transcrito, tipo_cultura)
+    
     try:
-        max_chars = 30000
-        if len(prompt) > max_chars:
-            texto_resumido = texto_transcrito[:max_chars - 20000]
-            prompt = prompt.replace(texto_transcrito, f"{texto_resumido}\n...[texto continua além do limite de caracteres]")
+        # Limitar o tamanho do texto
+        if len(texto_transcrito) > 15000:
+            st.info(f"Texto muito longo, usando as primeiras 15000 caracteres para análise de {tipo_cultura}...")
+            texto_para_analise = texto_transcrito[:15000]
+        else:
+            texto_para_analise = texto_transcrito
         
         response = modelo_texto.generate_content(prompt)
         resposta = response.text.strip()
         
+        # Limpar resposta
         resposta_limpa = resposta.replace('```json', '').replace('```', '').replace('JSON', '').strip()
         
+        # Tentar parsear JSON
         try:
             dados = json.loads(resposta_limpa)
             if isinstance(dados, list):
-                st.info(f"✅ Extraídos {len(dados)} registro(s)")
+                st.info(f"✅ Extraídos {len(dados)} registro(s) para {tipo_cultura}")
                 return dados
             elif isinstance(dados, dict):
-                st.info(f"✅ Extraído 1 registro")
+                st.info(f"✅ Extraído 1 registro para {tipo_cultura}")
                 return [dados]
             else:
                 st.warning(f"Formato inesperado: {type(dados)}")
@@ -311,26 +359,30 @@ def extrair_dados_para_csv(texto_transcrito):
         except json.JSONDecodeError as je:
             st.warning(f"JSONDecodeError: {str(je)}")
             
+            # Tentar extrair JSON da resposta
             array_match = re.search(r'(\[\s*\{.*\}\s*\])', resposta_limpa, re.DOTALL)
             if array_match:
                 try:
                     json_str = array_match.group(1)
+                    # Corrigir JSON
                     json_str = re.sub(r',\s*}', '}', json_str)
                     json_str = re.sub(r',\s*]', ']', json_str)
+                    # Corrigir aspas
+                    json_str = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', json_str)
                     dados = json.loads(json_str)
                     st.info(f"✅ Extraídos {len(dados)} registro(s) após limpeza")
                     return dados
                 except Exception as e:
                     st.warning(f"Erro ao parsear array extraído: {str(e)}")
             
-            obj_pattern = r'\{\s*"[^"]*"\s*:[^}]*\}'
-            obj_matches = re.findall(obj_pattern, resposta_limpa, re.DOTALL)
-            
+            # Tentar encontrar objetos individuais
+            obj_matches = re.findall(r'\{[^{}]*\}', resposta_limpa)
             if obj_matches:
                 dados = []
                 for obj_str in obj_matches:
                     try:
-                        obj = json.loads(obj_str)
+                        obj_str_corrigido = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', obj_str)
+                        obj = json.loads(obj_str_corrigido)
                         dados.append(obj)
                     except:
                         continue
@@ -338,28 +390,15 @@ def extrair_dados_para_csv(texto_transcrito):
                     st.info(f"✅ Extraídos {len(dados)} registro(s) de múltiplos objetos")
                     return dados
             
-            try:
-                if resposta_limpa.startswith('[') and resposta_limpa.endswith(']'):
-                    corrigido = resposta_limpa.replace("'", '"')
-                    corrigido = re.sub(r',\s*}', '}', corrigido)
-                    corrigido = re.sub(r',\s*]', ']', corrigido)
-                    
-                    dados = json.loads(corrigido)
-                    if isinstance(dados, list):
-                        st.info(f"✅ Extraídos {len(dados)} registro(s) após correção")
-                        return dados
-            except:
-                pass
-            
-            st.error(f"Não foi possível extrair JSON da resposta")
+            st.error(f"Não foi possível extrair JSON válido para {tipo_cultura}")
             return []
             
     except Exception as e:
-        st.error(f"Erro na extração: {str(e)}")
+        st.error(f"Erro na extração para {tipo_cultura}: {str(e)}")
         return []
 
-# Função 4: Criar DataFrame com tratamento de múltiplos RECs
-def criar_dataframe(dados):
+# Função para criar DataFrame com tratamento de cultura
+def criar_dataframe(dados, tipo_cultura):
     if not dados or not isinstance(dados, list):
         return pd.DataFrame(columns=COLUNAS_EXATAS)
     
@@ -376,7 +415,7 @@ def criar_dataframe(dados):
                 else:
                     # Buscar por similaridade
                     for chave in item.keys():
-                        if coluna.lower() == chave.lower():
+                        if coluna.lower() == chave.lower().strip():
                             valor = item[chave]
                             break
                         elif coluna.lower() in chave.lower() or chave.lower() in coluna.lower():
@@ -391,23 +430,24 @@ def criar_dataframe(dados):
                 elif not isinstance(valor, str):
                     valor = str(valor)
                 
-                # Para REC, garantir que seja número ou NR
-                if coluna == "REC":
-                    if valor == "NR" or not valor.strip():
+                # Limpar valor
+                if isinstance(valor, str):
+                    valor = valor.strip()
+                    if valor == "":
                         valor = "NR"
-                    else:
-                        # Extrair apenas números
-                        numeros = re.findall(r'\d+', str(valor))
-                        if numeros:
-                            valor = numeros[0]  # Primeiro número encontrado
-                        else:
-                            valor = "NR"
                 
-                linha[coluna] = valor.strip() if isinstance(valor, str) and valor.strip() != "" else valor
+                # FORÇAR "NR" para REC se for Milho
+                if coluna == "REC" and tipo_cultura == "Milho":
+                    valor = "NR"
+                
+                linha[coluna] = valor
+            
+            # Garantir que a cultura está correta
+            linha["Cultura"] = tipo_cultura
             
             # Verificar se tem dados válidos
-            valores_validos = [v for v in linha.values() if v != "NR" and v != "" and v is not None]
-            if valores_validos:
+            valores_nao_nr = [v for v in linha.values() if v != "NR"]
+            if valores_nao_nr:
                 linhas.append(linha)
     
     if linhas:
@@ -421,15 +461,19 @@ def criar_dataframe(dados):
         # Ordenar colunas
         df = df[COLUNAS_EXATAS]
         
-        # Ordenar por Cultura e REC
-        if 'Cultura' in df.columns and 'REC' in df.columns:
-            df = df.sort_values(['Cultura', 'REC']).reset_index(drop=True)
+        # Ordenar por Nome do produto e REC (se houver)
+        colunas_ordenacao = ['Nome do produto'] if 'Nome do produto' in df.columns else []
+        if 'REC' in df.columns and tipo_cultura == "Soja":
+            colunas_ordenacao.append('REC')
+        
+        if colunas_ordenacao:
+            df = df.sort_values(colunas_ordenacao).reset_index(drop=True)
         
         return df
     else:
         return pd.DataFrame(columns=COLUNAS_EXATAS)
 
-# Função 5: Gerar CSV
+# Função para gerar CSV
 def gerar_csv_para_gsheets(df):
     if df.empty:
         return ""
@@ -460,46 +504,32 @@ def gerar_csv_para_gsheets(df):
     
     return output.getvalue()
 
-# Função 6: Verificar dados
-def verificar_dados(df):
-    if df.empty:
-        return
-    
-    st.markdown("### 🔍 Análise dos Dados:")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("Total de Linhas", len(df))
-    
-    with col2:
-        if 'REC' in df.columns:
-            rec_validos = sum([1 for val in df['REC'] if str(val).strip() not in ['', 'NR']])
-            st.metric("RECs Válidos", rec_validos)
-    
-    with col3:
-        if 'Cultura' in df.columns:
-            culturas = df['Cultura'].nunique()
-            st.metric("Tipos de Cultura", culturas)
-    
-    # Mostrar exemplos de valores de meses
-    if any(mes in df.columns for mes in meses_detalhados):
-        with st.expander("📊 Exemplos de valores de meses"):
-            meses_com_dados = [col for col in meses_detalhados if col in df.columns and not df[col].isna().all()]
-            if meses_com_dados:
-                amostra = df[['Cultura', 'Nome do produto', 'REC'] + meses_com_dados[:5]].head(3)
-                st.dataframe(amostra, use_container_width=True)
-
 # Interface principal
 def main():
     st.markdown("### 📤 Carregue um arquivo PDF com informações de cultivares")
-    st.markdown(f"**Total de colunas: {len(COLUNAS_EXATAS)}**")
-    st.markdown(f"**Colunas de meses: {len(meses_detalhados)}** (Janeiro 1 a Dezembro 3)")
+    
+    # Seletor de tipo de cultura
+    st.markdown("### 🌽 Selecione o tipo de cultura:")
+    tipo_cultura = st.radio(
+        "Tipo de cultura:",
+        ["Milho", "Soja"],
+        horizontal=True,
+        index=0 if st.session_state.tipo_cultura == "Milho" else 1
+    )
+    
+    # Atualizar session state
+    st.session_state.tipo_cultura = tipo_cultura
+    
+    st.markdown(f"**Configuração atual:** {tipo_cultura}")
+    if tipo_cultura == "Soja":
+        st.info("🔍 Para Soja: o sistema extrairá números de REC das tabelas")
+    else:
+        st.info("🌽 Para Milho: a coluna REC será sempre 'NR'")
     
     uploaded_file = st.file_uploader(
-        "Selecione um arquivo PDF:",
+        f"Selecione um arquivo PDF de {tipo_cultura}:",
         type=["pdf"],
-        help="PDF técnico sobre cultivares agrícolas"
+        help=f"PDF técnico sobre cultivares de {tipo_cultura}"
     )
     
     if uploaded_file:
@@ -516,73 +546,127 @@ def main():
                 st.session_state.imagens_paginas = []
                 st.rerun()
         
-        if processar:
-            st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
-            st.session_state.csv_content = ""
-            st.session_state.texto_transcrito = ""
-            st.session_state.imagens_paginas = []
-            
-            try:
-                with st.spinner("🔄 Convertendo PDF para imagens..."):
-                    imagens = pdf_para_imagens(uploaded_file.getvalue())
-                    if not imagens:
-                        st.error("❌ Falha ao converter PDF")
-                        return
-                    st.session_state.imagens_paginas = imagens
-                    st.success(f"✅ {len(imagens)} página(s) convertida(s)")
-                
-                with st.spinner("🤖 Transcrevendo texto das páginas..."):
-                    texto_completo = processar_imagens_em_lote(imagens)
-                    if texto_completo:
-                        st.session_state.texto_transcrito = texto_completo
-                        st.success(f"✅ Transcrição concluída ({len(texto_completo):,} caracteres)")
-                    else:
-                        st.error("❌ Falha na transcrição")
-                        return
-                
-                with st.spinner("📊 Extraindo dados estruturados..."):
-                    dados = extrair_dados_para_csv(texto_completo)
-                    
-                    if dados:
-                        st.info(f"ℹ️ {len(dados)} registro(s) encontrado(s)")
-                        
-                        df = criar_dataframe(dados)
-                        st.session_state.df = df
-                        
-                        if not df.empty:
-                            csv_content = gerar_csv_para_gsheets(df)
-                            st.session_state.csv_content = csv_content
-                            st.success(f"✅ {len(df)} linha(s) extraída(s) com sucesso!")
-                            verificar_dados(df)
-                        else:
-                            st.warning("⚠️ DataFrame vazio")
-                    else:
-                        st.warning("⚠️ Nenhum dado estruturado encontrado")
-                
-            except Exception as e:
-                st.error(f"❌ Erro no processamento: {str(e)}")
+        # Campo para colar texto transcrito manualmente
+        with st.expander("⚙️ Debug: Colar texto transcrito manualmente"):
+            texto_manual = st.text_area("Cole o texto transcrito aqui para testar:", height=200)
+            if st.button("Testar com este texto") and texto_manual:
+                st.session_state.texto_transcrito = texto_manual
+                st.success("Texto carregado para teste!")
         
+        if processar:
+            with st.spinner("Processando..."):
+                # Limpar estado anterior
+                st.session_state.df = pd.DataFrame(columns=COLUNAS_EXATAS)
+                st.session_state.csv_content = ""
+                st.session_state.texto_transcrito = ""
+                st.session_state.imagens_paginas = []
+                
+                try:
+                    # PASSO 1: Converter PDF para imagens
+                    with st.spinner("🔄 Convertendo PDF para imagens..."):
+                        imagens = pdf_para_imagens(uploaded_file.getvalue())
+                        if not imagens:
+                            st.error("❌ Falha ao converter PDF")
+                            return
+                        st.session_state.imagens_paginas = imagens
+                    
+                    # PASSO 2: Transcrever imagens
+                    with st.spinner("🤖 Transcrevendo texto das páginas..."):
+                        texto_completo = processar_imagens_em_lote(imagens, batch_size=2)
+                        if texto_completo:
+                            st.session_state.texto_transcrito = texto_completo
+                            st.success(f"✅ Transcrição concluída para {tipo_cultura}")
+                            
+                            # Mostrar amostra do texto
+                            with st.expander("📝 Ver texto transcrito (amostra)"):
+                                st.text_area("Texto:", texto_completo[:3000], height=300)
+                        else:
+                            st.error("❌ Falha na transcrição")
+                            return
+                    
+                    # PASSO 3: Extrair dados
+                    with st.spinner(f"📊 Extraindo dados para {tipo_cultura}..."):
+                        dados = extrair_dados_para_csv(texto_completo, tipo_cultura)
+                        
+                        if dados:
+                            st.info(f"ℹ️ {len(dados)} registro(s) encontrado(s)")
+                            
+                            # Criar DataFrame
+                            df = criar_dataframe(dados, tipo_cultura)
+                            st.session_state.df = df
+                            
+                            if not df.empty:
+                                # Gerar CSV
+                                csv_content = gerar_csv_para_gsheets(df)
+                                st.session_state.csv_content = csv_content
+                                st.success(f"✅ {len(df)} linha(s) extraída(s) com sucesso!")
+                                
+                                # Mostrar estatísticas
+                                st.markdown("### 📊 Estatísticas:")
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("Linhas", len(df))
+                                with col2:
+                                    if 'Cultura' in df.columns:
+                                        st.metric("Cultura", tipo_cultura)
+                                with col3:
+                                    if 'Nome do produto' in df.columns:
+                                        produtos = df['Nome do produto'].unique()
+                                        st.metric("Produtos", len(produtos))
+                                with col4:
+                                    if 'REC' in df.columns:
+                                        if tipo_cultura == "Soja":
+                                            recs_validos = sum([1 for val in df['REC'] if str(val).strip() not in ['', 'NR']])
+                                            st.metric("RECs", recs_validos)
+                                        else:
+                                            st.metric("RECs", "NR (Milho)")
+                                
+                                # Mostrar amostra dos dados
+                                with st.expander("👀 Visualizar amostra dos dados"):
+                                    st.dataframe(df.head(), use_container_width=True)
+                            else:
+                                st.warning("⚠️ DataFrame vazio após processamento")
+                        else:
+                            st.warning("⚠️ Nenhum dado estruturado encontrado no texto")
+                
+                except Exception as e:
+                    st.error(f"❌ Erro no processamento: {str(e)}")
+        
+        # Mostrar resultados se existirem
         df = st.session_state.df
         
         if not df.empty:
             st.markdown("---")
-            st.markdown(f"### 📋 Resultados: {len(df)} linha(s) encontrada(s)")
+            st.markdown(f"### 📋 Dados Extraídos para {tipo_cultura} ({len(df)} linha(s))")
             
-            verificar_dados(df)
+            # Mostrar DataFrame completo
+            st.markdown("### 📊 Tabela Completa de Dados")
             
-            with st.expander("📝 Ver texto transcrito (resumido)"):
-                texto_resumido = st.session_state.texto_transcrito[:5000] + "..." if len(st.session_state.texto_transcrito) > 5000 else st.session_state.texto_transcrito
-                st.text_area("Texto extraído:", texto_resumido, height=300)
-            
-            st.markdown("### 📊 Dados Extraídos")
-            
-            colunas_com_dados = [col for col in COLUNAS_EXATAS if col in df.columns and not df[col].isna().all() and df[col].nunique() > 1]
+            # Filtrar colunas com dados
+            colunas_com_dados = []
+            for col in COLUNAS_EXATAS:
+                if col in df.columns:
+                    valores_unicos = df[col].dropna().unique()
+                    valores_validos = [v for v in valores_unicos if str(v).strip() not in ['', 'NR', 'nan']]
+                    if valores_validos:
+                        colunas_com_dados.append(col)
             
             if len(colunas_com_dados) < len(COLUNAS_EXATAS):
                 st.info(f"Mostrando {len(colunas_com_dados)} colunas com dados")
             
-            st.dataframe(df[colunas_com_dados] if colunas_com_dados else df, use_container_width=True)
+            # Mostrar tabela
+            st.dataframe(df[colunas_com_dados] if colunas_com_dados else df, use_container_width=True, height=400)
             
+            # Verificação especial para REC
+            if tipo_cultura == "Milho":
+                if 'REC' in df.columns:
+                    recs = df['REC'].unique()
+                    if len(recs) == 1 and recs[0] == "NR":
+                        st.success("✅ Coluna REC corretamente definida como 'NR' para Milho")
+                    else:
+                        st.warning(f"⚠️ Atenção: REC encontrados para Milho: {recs}")
+            
+            # Download
             st.markdown("---")
             st.markdown("### 📥 Download dos Dados")
             
@@ -596,7 +680,7 @@ def main():
                     st.download_button(
                         label="⬇️ Baixar CSV",
                         data=st.session_state.csv_content.encode('utf-8'),
-                        file_name=f"cultivares_{nome_base}_{timestamp}.csv",
+                        file_name=f"{tipo_cultura.lower()}_cultivares_{nome_base}_{timestamp}.csv",
                         mime="text/csv",
                         type="primary",
                         use_container_width=True
@@ -607,7 +691,7 @@ def main():
                     st.download_button(
                         label="⬇️ Baixar JSON",
                         data=json_data.encode('utf-8'),
-                        file_name=f"cultivares_{nome_base}_{timestamp}.json",
+                        file_name=f"{tipo_cultura.lower()}_cultivares_{nome_base}_{timestamp}.json",
                         mime="application/json",
                         use_container_width=True
                     )
@@ -615,9 +699,8 @@ def main():
         elif st.session_state.texto_transcrito:
             st.info("📝 Texto transcrito disponível, mas nenhum dado estruturado foi extraído.")
             
-            with st.expander("Ver texto transcrito"):
-                texto_resumido = st.session_state.texto_transcrito[:2000] + "..." if len(st.session_state.texto_transcrito) > 2000 else st.session_state.texto_transcrito
-                st.text_area("Texto:", texto_resumido, height=300)
+            with st.expander("Ver texto transcrito completo"):
+                st.text_area("Texto:", st.session_state.texto_transcrito, height=400)
     
     else:
         st.info("👆 **Carregue um arquivo PDF acima para começar**")
@@ -626,23 +709,31 @@ def main():
             st.markdown(f"""
             ### 📋 Fluxo de Processamento:
             
-            1. **Carregue um PDF** com informações de cultivares
-            2. **Conversão**: Cada página vira uma imagem
-            3. **Transcrição**: IA extrai texto das imagens
-            4. **Extração**: IA identifica dados em {len(COLUNAS_EXATAS)} colunas
-            5. **Download**: CSV e JSON disponíveis
+            1. **Selecione o tipo de cultura**: Milho ou Soja
+            2. **Carregue um PDF** com informações de cultivares
+            3. **Conversão**: Cada página vira uma imagem
+            4. **Transcrição**: IA extrai texto das imagens
+            5. **Extração**: IA identifica dados nas {len(COLUNAS_EXATAS)} colunas
+            6. **Download**: CSV e JSON disponíveis
             
-            ### 🔍 Dados extraídos:
-            - **REC**: Números como 201, 300, 400 (cada REC em linha separada)
-            - **Meses**: 36 períodos com valores reais das tabelas
-            - **Cultivares**: Nomes e características
-            - **Regiões**: Estados e regiões recomendados
+            ### 🔍 Diferenças por cultura:
             
-            ### 📊 Formato dos meses:
-            - Janeiro 1, Janeiro 2, Janeiro 3
-            - Fevereiro 1, Fevereiro 2, Fevereiro 3
-            - ... até Dezembro 3
-            - **Valores reais**: "180-260", "sc/ha", números, etc.
+            **🌽 MILHO:**
+            - Coluna REC sempre preenchida com "NR"
+            - Doenças específicas do milho não preenchem colunas de soja
+            - Cada linha representa uma cultivar com seus meses
+            
+            **🌱 SOJA:**
+            - Extrai números de REC das tabelas
+            - Preenche colunas de doenças específicas da soja
+            - Cada REC gera uma linha separada
+            - Valida resistências a nematoides e doenças
+            
+            ### ⚠️ Observações:
+            - Processamento pode levar alguns minutos
+            - Verifique sempre os dados extraídos
+            - Para Milho, REC será sempre "NR"
+            - Para Soja, verifique se os RECs foram extraídos corretamente
             """)
 
 if __name__ == "__main__":
