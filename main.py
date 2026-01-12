@@ -349,7 +349,6 @@ if uploaded_file:
                 
                 if not paginas:
                     st.error("Falha ao extrair páginas")
-                    return
                 
                 todas_tabelas = []
                 
